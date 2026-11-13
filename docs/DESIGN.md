@@ -211,7 +211,11 @@ Two defects were found by these levels and not by review: group IDs carried over
 node could collide with automatically assigned ones (simulated commands), and two runs within one
 second shared a backup directory, so a restore could bring back an older file (real apply).
 
-Still to do on a production cluster: a `sync --dry-run` of grantctl next to nst-cockpit on NST.
+Rehearsal on the NST cluster (2026-11-13, 1.0.0 built by CI, read-only): `sync --dry-run` next to
+nst-cockpit on the five reachable nodes. grantctl planned no account, group, lock or password
+change. On every node the sshd, sudoers and limits rules it would write are line for line the
+rules nst-cockpit had written; only the file names change, and on the GPU node the six slice
+drop-ins are rewritten under grantctl's name.
 
 ## 10. Packaging
 
@@ -237,9 +241,9 @@ Still to do on a production cluster: a `sync --dry-run` of grantctl next to nst-
 
 ## 12. Risks and what to revisit
 
-- **Production rehearsal.** The apply logic is tested against simulated machines, a real Ubuntu
-  system and containers over SSH, but not yet against the NST cluster. Run `sync --dry-run` there
-  and compare with nst-cockpit before the first real sync.
+- **First real sync on production.** The apply logic is tested against simulated machines, a
+  real Ubuntu system and containers over SSH, and the dry run on NST matches nst-cockpit. A real
+  sync has not run on NST yet: do it one node at a time, with a root shell open.
 - **Version skew** between control node and nodes is new. The protocol check stops it, at the
   cost of an install step per node.
 - **Serial sync.** 1.0 syncs nodes one after another, control node first. Parallel sync is easy to
