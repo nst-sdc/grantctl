@@ -364,6 +364,28 @@ fn a_sudoers_tree_broken_by_the_change_is_rolled_back() {
     assert_eq!(sys.members("students"), ["carol", "dave", "erin"]);
 }
 
+/// Found by the real-system test: two runs within one second shared a backup
+/// directory, and the restore of the second brought back a file that the
+/// first had removed.
+#[test]
+fn a_restore_never_brings_back_files_from_an_older_backup() {
+    let (mut sys, mut cfg) = legacy_machine();
+    assert!(apply(&mut sys, &state_of(&cfg, "node1"), false).ok);
+    assert!(sys.file(LOCKDOWN).is_none());
+    cfg.baseline.push("BROKEN yes".into());
+    let r = apply(&mut sys, &state_of(&cfg, "node1"), false);
+    assert!(!r.ok);
+    assert_eq!(
+        r.backup.as_deref(),
+        Some("/var/backups/grantctl/20261113-120000-2")
+    );
+    assert!(
+        sys.file(LOCKDOWN).is_none(),
+        "restored from the wrong backup"
+    );
+    assert!(sys.file(SSHD_MAIN).is_some_and(|t| !t.contains("BROKEN")));
+}
+
 // ---------------------------------------------------------------- guards
 
 #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "grantctl"
-version = "2.0.0-alpha.1"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.91"
 description = "Manage accounts, SSH, sudo and resource limits across a small Debian/Ubuntu cluster from one file"

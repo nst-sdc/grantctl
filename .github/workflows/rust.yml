@@ -16,10 +16,39 @@ jobs:
       - run: cargo test
 
   resolute:
-    name: tests with Ubuntu 26.04's own rustc
+    name: tests and real-system test on Ubuntu 26.04
     runs-on: ubuntu-latest
     container: ubuntu:26.04
     steps:
-      - run: apt-get update -qq && apt-get install -y -qq cargo rustc ca-certificates git
+      - run: apt-get update -qq && apt-get install -y -qq cargo rustc ca-certificates git openssh-server sudo jq openssl
       - uses: actions/checkout@v4
       - run: rustc --version && cargo test
+      - run: cargo build --release
+      # Real useradd, gpasswd, visudo and sshd -t, as root, in this throw-away container.
+      - run: GRANTCTL_DISPOSABLE=1 tests/system/node.sh target/release/grantctl
+
+  e2e:
+    name: end to end over SSH (3 containers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release
+      - run: tests/e2e/run.sh target/release/grantctl
+
+  package:
+    name: Debian package, built offline as on Launchpad
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq git ca-certificates build-essential devscripts equivs lintian
+      - uses: actions/checkout@v4
+      - run: mk-build-deps -i -r -t 'apt-get -y -qq --no-install-recommends' debian/control
+      # No network from here on: the build must not download anything.
+      - run: unshare -n true 2>/dev/null && unshare -n dpkg-buildpackage -us -uc -b || dpkg-buildpackage -us -uc -b
+      - run: dpkg -c ../grantctl_*.deb && apt-get install -y -qq ../grantctl_*.deb && grantctl version && test -f /usr/share/man/man8/grantctl.8.gz
+      - run: lintian --no-tag-display-limit ../grantctl_*.deb || true
+      - run: mkdir -p out && cp ../grantctl_*.deb out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grantctl-deb
+          path: out/*.deb

@@ -1,0 +1,33 @@
+#!/usr/bin/make -f
+# Builds offline against the Rust crates packaged in the Ubuntu archive
+# (librust-*-dev install their sources under /usr/share/cargo/registry).
+# Launchpad builders have no network access, so nothing may be downloaded.
+
+export CARGO_HOME = $(CURDIR)/debian/cargo_home
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	mkdir -p $(CARGO_HOME)
+	printf '%s\n' \
+	  '[source.crates-io]' 'replace-with = "archive"' \
+	  '[source.archive]' 'directory = "/usr/share/cargo/registry"' \
+	  '[net]' 'offline = true' > $(CARGO_HOME)/config.toml
+	# Cargo.lock pins the crates.io versions used in development. The
+	# archive carries its own (compatible) versions, so resolve afresh.
+	if [ -f Cargo.lock ]; then mv Cargo.lock Cargo.lock.upstream; fi
+
+override_dh_auto_build:
+	cargo build --release --offline
+
+override_dh_auto_test:
+	cargo test --release --offline
+
+override_dh_auto_install:
+	install -D -m 0755 target/release/grantctl debian/grantctl/usr/bin/grantctl
+	install -D -m 0644 man/grantctl.8 debian/grantctl/usr/share/man/man8/grantctl.8
+
+override_dh_auto_clean:
+	rm -rf target $(CARGO_HOME)
+	if [ -f Cargo.lock.upstream ]; then mv -f Cargo.lock.upstream Cargo.lock; fi

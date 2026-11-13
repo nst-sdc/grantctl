@@ -2,52 +2,98 @@
 
 One file to manage who can log in where, with what rights, across a small Linux cluster.
 
-This branch (`rust`) is the Rust implementation, version 2, **in development**. The production
-version is the bash implementation on the [`main`](https://github.com/nst-sdc/grantctl/tree/main)
-branch (published as nst-cockpit 1.0.0).
+Each user is one line in `/etc/grantctl/access.conf`:
 
-- Design and milestones: [docs/DESIGN.md](docs/DESIGN.md)
-- Target platform: Ubuntu 26.04 LTS and later
-- Distribution: `ppa:nst-sdc/grantctl` (first release will be 2.0.0)
-
-## Status
-
-| Milestone | Scope | State |
-|---|---|---|
-| M1 | Configuration model, validation, token editing, per-node desired state, parity tests against v1, offline commands | done |
-| M2 | Node side: `grantctl node facts` / `node apply` (widen, switch, narrow), backups, rollback | next |
-| M3 | Control side: SSH transport, `sync`, `grant`, `revoke`, `init`, `audit`, `node install`, ... | |
-| M4 | Packaging, PPA release, cutover of the NST cluster | |
-
-What works today, without contacting any node:
-
-```bash
-cargo build
-G="target/debug/grantctl --config-dir tests/fixtures/teaching"
-$G roles                                         # effective role table
-$G check --operator alice                        # validate the configuration
-$G plan gpu1 --operator alice --control-ip 192.0.2.10          # what gpu1 should look like
-$G plan gpu1 --operator alice --control-ip 192.0.2.10 --json   # the same, as sent to a node
+```
+alice    admin nopasswd          # sudo everywhere
+maya     student gpu@gpu1        # shell on the jump host, GPU box as well
+ravi     user@node3 locked       # account kept, login blocked
 ```
 
-The configuration formats (`access.conf`, `roles.ini`, `nodes`) are the ones v1 uses. See
-`tests/fixtures/teaching/` for a complete example.
+Roles (`admin`, `student`, `gpu`, ...) are defined in `roles.ini`: which Unix groups they mean, on
+which nodes, whether password login is allowed, from where, with which resource limits.
+`grantctl sync` then makes every node match: accounts, exact group membership, sshd and sudoers
+rules, pam limits, systemd slice limits, quotas and locks.
+
+- Runs from one **control node** over SSH. No daemon, no open port.
+- **Safe ordering**: access is added first, then the sudoers and sshd files are replaced
+  (validated with `visudo` and `sshd -t`, rolled back on failure), and only then is access removed.
+  A failed run cannot lock anyone out.
+- `--dry-run` shows every change first, including who gains and who loses SSH access.
+- **One password everywhere**: new accounts copy the user's password from the control node.
+- Accounts that are not in the file are reported, never touched.
+
+Target platform: Ubuntu 26.04 LTS and later. This branch (`rust`) is grantctl 1.0.0, a rewrite of
+the bash tool nst-cockpit, which is still on the
+[`main`](https://github.com/nst-sdc/grantctl/tree/main) branch.
+
+## Install
+
+On the control node and on every node:
+
+```bash
+sudo add-apt-repository ppa:nst-sdc/grantctl
+sudo apt install grantctl
+```
+
+Or install it on the control node only and let it install itself on the others:
+
+```bash
+grantctl node install node2 node3 gpu1          # from the PPA
+grantctl node install --copy node2 node3 gpu1   # copy the binary, for nodes without internet
+```
+
+You need SSH access and sudo on every node. After the first sync you need the `nopasswd` flag on
+every node except the control node.
+
+## First run
+
+```bash
+grantctl init node1 node2 node3 gpu1    # control node first; drafts access.conf from the nodes
+sudoedit /etc/grantctl/roles.ini        # define your roles (see examples/)
+sudoedit /etc/grantctl/access.conf      # resolve every `review`
+grantctl check
+grantctl sync --dry-run                 # read this before the real thing
+grantctl sync
+```
+
+`init` changes nothing on the nodes. Files of earlier tooling that grantctl should replace go into
+`LEGACY_SSHD` / `LEGACY_SUDO` in `/etc/grantctl/grantctl.conf`.
+
+Coming from nst-cockpit: `grantctl init --from-cockpit` copies `/etc/nst-cockpit`, and the first
+sync replaces the nst-cockpit files on every node.
+
+## Every day
+
+```bash
+grantctl grant maya student             # new user: account, groups, one temporary password
+grantctl grant maya gpu --on gpu1
+grantctl where maya                     # state on every node
+grantctl revoke maya gpu
+grantctl lock maya                      # keys and password blocked, sessions ended
+grantctl passwd maya                    # new temporary password on all nodes
+grantctl delete maya --purge
+grantctl audit                          # what else on the nodes affects access
+```
+
+Full reference: `man grantctl`. Design and guarantees: [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Development
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
-- `tests/logic.rs`: the unit tests of v1, ported, plus cases for behaviour new in v2.
-- `tests/parity.rs`: the planner must reproduce the output of the published bash v1 for the fixture
-  cluster. The expected output is `tests/golden/teaching.golden`; regenerate it on Linux with
-  `tests/golden/regen-from-v1.sh` and `git show main:bin/nst-cockpit`.
+| Test | What it proves | Needs |
+|---|---|---|
+| `cargo test` | parsers, planner (parity with nst-cockpit output), apply ordering and failure handling against a simulated machine, whole commands against a simulated cluster | nothing |
+| `tests/system/node.sh` | the node side with real `useradd`, `visudo`, `sshd -t` | root in a **disposable** container |
+| `tests/e2e/run.sh` | control node and two nodes over real SSH | docker |
+
+CI runs all of them, and builds the Debian package offline the way Launchpad does.
 
 Minimum supported Rust: 1.91 (Ubuntu 26.04 ships 1.93). Dependencies are limited to `clap`,
-`serde` and `serde_json`, because the PPA build has no network access.
+`serde` and `serde_json`, all packaged in Ubuntu, because the PPA build has no network access.
 
 ## License
 

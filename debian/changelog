@@ -1,0 +1,10 @@
+grantctl (1.0.0) resolute; urgency=medium
+
+  * First release of grantctl, the Rust successor of nst-cockpit.
+  * One binary for the control node and every managed node; the control side
+    reaches `grantctl node ...` over SSH.
+  * Changes are applied as widen, switch, narrow: access is only removed
+    after the new sudoers and sshd rules are validated and live.
+  * Passwords follow the control node unless changed on a node.
+
+ -- Krushn Dayshmookh <krushndayshmookh@gmail.com>  Fri, 13 Nov 2026 22:00:00 +0530

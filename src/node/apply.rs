@@ -687,7 +687,14 @@ fn switch(
         .stdout
         .trim()
         .to_string();
-    let backup = format!("{BACKUP_DIR}/{stamp}");
+    // Never reuse a directory: copying into an older backup would mix two
+    // states, and a later restore would bring back files from the older one.
+    let mut backup = format!("{BACKUP_DIR}/{stamp}");
+    let mut n = 1;
+    while sys.query(&["test", "-e", &backup]).ok {
+        n += 1;
+        backup = format!("{BACKUP_DIR}/{stamp}-{n}");
+    }
     sys.run(&["mkdir", "-p", &backup], None)?;
     let dirs = [SSHD_DIR, SUDOERS_DIR, LIMITS_DIR];
     for dir in dirs {

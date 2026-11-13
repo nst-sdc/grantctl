@@ -1,0 +1,13 @@
+# Example roster for the roles in examples/roles.ini (fictional users).
+#   <user> <token> [token..]   [# comment]
+#   token: role | role@node,node | flag | flag@node     flags: locked nopasswd pwonly
+alice            admin nopasswd                     # the operator: sudo everywhere, no password prompt
+bob              admin nopasswd@node2,node3
+carol            instructor
+dave             student
+erin             student gpu pwonly@node1           # password-only on the jump host
+frank            student gpu@node3,gpu1 locked@gpu1
+gina             user@node3
+heidi            ops nopasswd
+ivan             lab user@node2
+judy             student locked                     # account kept, login blocked everywhere

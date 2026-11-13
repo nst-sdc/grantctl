@@ -1,6 +1,6 @@
-# grantctl v2 design
+# grantctl design
 
-Status: draft for review. Milestone 1 is implemented; sections marked **open** need a decision.
+Status: implemented in grantctl 1.0.0. In this document v1 means the bash tool nst-cockpit, v2 means this Rust rewrite (released as grantctl 1.0.0).
 Maintainers: Krushn Dayshmookh, Raghav.
 
 ## 1. Background
@@ -41,7 +41,7 @@ Non-functional:
 - Few dependencies: `clap`, `serde`, `serde_json`. All three are packaged in Ubuntu 26.04
   (clap 4.5.53, serde 1.0.228, serde_json 1.0.145).
 
-Out of scope for 2.0: LDAP/SSSD, SSH key distribution, password synchronisation between nodes,
+Out of scope for 1.0: LDAP/SSSD, SSH key distribution, password synchronisation between nodes,
 non-Debian distributions, a web UI.
 
 ## 3. Architecture
@@ -63,7 +63,7 @@ One binary, installed on the control node and on every managed node.
 ```
 
 - **Control side**: reads the configuration, validates it, and computes a `NodeDesired` for each
-  node. Pure functions, no I/O beyond reading the configuration. Implemented and tested (M1).
+  node. Pure functions, no I/O beyond reading the configuration.
 - **Node side**: `grantctl node apply` reads a `NodeDesired` as JSON on stdin, compares it with the
   machine, and applies the difference in a fixed order (section 6). With `--dry-run` it only reports.
   It answers with a JSON report: every action taken or needed, warnings, and whether it stopped.
@@ -132,7 +132,7 @@ locks, AllowGroups, Match blocks, sudoers rules, limits, slices and quotas are i
 One intended difference: when a user holds several roles that define `home`, `slice` or `quota`,
 the first role on the user's line wins. v1 applied whichever sorted last.
 
-## 6. Applying a desired state (node side, M2)
+## 6. Applying a desired state (node side)
 
 Order of operations in `grantctl node apply`. The rule: **widen, switch, narrow**.
 
@@ -173,57 +173,76 @@ Backups go to `/var/backups/grantctl/<timestamp>/`. State (applied quotas) lives
 `sync` reports nodes where grantctl is missing or speaks another protocol, with the exact
 `node install` command. `grantctl node upgrade` upgrades the package everywhere.
 
-## 8. Passwords (**open**)
+## 8. Passwords
 
-v1 generated new temporary passwords on every run, so syncing nodes one at a time gave a user a
-different password on each node. Proposal for 2.0:
+Rule: a user has the same password on every node, unless they change it on a node themselves.
 
-- A brand-new user (no account anywhere) gets one temporary password, set on every node where the
-  account is created in that run, with a forced change.
-- A user who already exists somewhere and gains a node gets an account with a locked password there.
-  The sync report lists these with the command `grantctl passwd <user> --on <nodes>`.
-- **Open:** should a new account instead inherit the user's password hash from the control node?
-  It gives "same password as on the jump host" with no temporary password, at the cost of copying
-  hashes between nodes. Passwords would still diverge after the next change.
+- The control node is the source. `sync` asks it for the usable password hashes of the managed
+  users (`grantctl node hashes`) after the control node itself has been synced.
+- A new account on another node gets that hash, and the "must change at next login" state with it.
+- Each node records the hash grantctl last set (`/var/lib/grantctl/passwords`, root only). On a
+  later sync, a newer hash from the control node is applied only where the account still has the
+  recorded hash, that is, where the user has not changed the password on that node.
+- A user who is new everywhere gets one temporary password on the control node, printed once; the
+  other nodes copy it in the same run. A user without an account on the control node gets one
+  temporary password on all their nodes.
+- Accounts that existed before grantctl have no recorded hash and are never overwritten.
+  `grantctl passwd <user>` (new temporary password everywhere) or
+  `grantctl passwd <user> --from-control` (copy the control node's) brings them under the rule.
+- Hashes travel inside the desired state over SSH, are set with `chpasswd -e` on stdin, and never
+  appear in a report, a dry-run or a process list.
+
+Limit: a password changed on the control node reaches the other nodes at the next `sync`, not
+immediately.
 
 ## 9. Testing
 
-| Level | What | Status |
+| Level | What | Where it runs |
 |---|---|---|
-| Unit | parsers, validation, token editing, desired state (the 36 v1 tests ported, plus new cases) | done |
-| Parity | planner output equals v1 output for the fixture cluster | done |
-| Node integration | `node apply` inside an Ubuntu 26.04 container: real `useradd`, `visudo`, `sshd -t`; failure injection for the widen/switch/narrow guarantees | M2 |
-| End to end | control container plus node containers over SSH | M3 |
-| Production rehearsal | v1 and v2 dry runs side by side on the NST cluster; switch when they agree | M4 |
+| Unit | parsers, validation, token editing, desired state (the 36 v1 tests ported, plus new cases) | `cargo test`, any OS |
+| Parity | planner output equals v1 output for the fixture cluster | `tests/parity.rs` |
+| Apply, simulated | `node apply` against an in-memory machine: ordering, guards, failure injection at every phase, v1 migration | `tests/apply.rs` |
+| Commands, simulated | `sync`, `grant`, `revoke`, `lock`, `passwd`, `prune`, `delete`, `init`, `adopt`, `audit` against a simulated 3-node cluster | `tests/control.rs` |
+| Apply, real | the node side as root with real `useradd`, `gpasswd`, `visudo`, `sshd -t`, `chpasswd`: converge, idempotence, failed switch restores byte-identical files, guards, passwords | `tests/system/node.sh`, CI in `ubuntu:26.04` |
+| End to end | control container and two node containers over real SSH: init, `node install --copy`, sync, password login with the printed password, day-to-day commands, an unreachable node | `tests/e2e/run.sh`, CI |
+| Package | `dpkg-buildpackage` offline in `ubuntu:26.04`, install, run | CI |
 
-CI: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` on stable, and `cargo test` in an
-`ubuntu:26.04` container with the distribution's rustc.
+Two defects were found by these levels and not by review: group IDs carried over from the control
+node could collide with automatically assigned ones (simulated commands), and two runs within one
+second shared a backup directory, so a restore could bring back an older file (real apply).
 
-## 10. Packaging (M4)
+Still to do on a production cluster: a `sync --dry-run` of grantctl next to nst-cockpit on NST.
 
-- `debian/` in this repository, built for 26.04 (`resolute`) in `ppa:nst-sdc/grantctl`.
-- Launchpad builders have no network. Two ways to provide the crates; decide in M4:
-  build against the archive's `librust-*-dev` packages with dh-cargo (no vendoring, tied to the
-  archive's versions), or ship a vendored tarball (self-contained, larger source package).
+## 10. Packaging
+
+- `debian/` in this repository, native package, built for 26.04 (`resolute`) in
+  `ppa:nst-sdc/grantctl`.
+- Launchpad builders have no network. The build uses the Rust crates packaged in the archive
+  (`librust-clap-4.5+derive-dev`, `librust-serde-1+derive-dev`, `librust-serde-json-dev`) through a
+  cargo directory source, so nothing is vendored and nothing is downloaded. `Cargo.lock` pins the
+  crates.io versions used in development and is set aside during the package build.
 - The package installs `/usr/bin/grantctl`, the man page and example configuration.
-- n1 of the NST cluster runs Ubuntu 25.10, which is end of life. It must be upgraded to 26.04 before
-  the cutover.
+- n1 of the NST cluster runs Ubuntu 25.10, which is end of life. It must be upgraded to 26.04
+  before it can install the package; until then `grantctl node install --copy` works.
 
 ## 11. Milestones
 
 | | Scope | State |
 |---|---|---|
-| M1 | Configuration model, validation, token editing, desired state, parity tests, offline CLI (`roles`, `list`, `check`, `plan`) | done |
-| M2 | Node side: `node facts`, `node apply` with widen/switch/narrow, backups and rollback, account operations, container tests | next |
-| M3 | Control side: SSH transport, `sync`, `grant`/`revoke`/`lock`, `init`/`adopt`/`prune`, `audit`, `status`, `where`, `passwd`, `delete`, `node install` | |
-| M4 | Packaging, man page, PPA release 2.0.0, side-by-side rehearsal and cutover on NST | |
+| M1 | Configuration model, validation, token editing, desired state, parity tests | done |
+| M2 | Node side: `node facts`, `node apply` with widen/switch/narrow, backups and rollback, account operations | done |
+| M3 | Control side: SSH transport, `sync`, `grant`/`revoke`/`lock`, `init`/`adopt`/`prune`, `audit`, `status`, `where`, `passwd`, `delete`, `node install` | done |
+| M4 | Packaging, man page, CI for real-system, end-to-end and package builds | done |
+| Release | PPA upload of 1.0.0, rehearsal and cutover on NST | maintainers |
 
 ## 12. Risks and what to revisit
 
-- **Parity on the node side.** The planner is proven against v1; the apply logic is new code. The
-  container tests in M2 and the side-by-side dry run in M4 are the safety net.
-- **Version skew** between control node and nodes is new in v2. The protocol check stops it, at the
+- **Production rehearsal.** The apply logic is tested against simulated machines, a real Ubuntu
+  system and containers over SSH, but not yet against the NST cluster. Run `sync --dry-run` there
+  and compare with nst-cockpit before the first real sync.
+- **Version skew** between control node and nodes is new. The protocol check stops it, at the
   cost of an install step per node.
-- **Serial sync.** 2.0 syncs nodes one after another, control node first. Parallel sync is easy to
-  add once the report format is stable; it is not needed for seven nodes.
-- **PAM** (faillock, `nullok`) is reported by `audit` but not managed. Revisit after 2.0.
+- **Serial sync.** 1.0 syncs nodes one after another, control node first. Parallel sync is easy to
+  add once the report format has settled; it is not needed for seven nodes.
+- **PAM** (faillock, `nullok`) is reported by `audit` but not managed.
+- **`where`** shows less than nst-cockpit did: no last login and no quota usage.

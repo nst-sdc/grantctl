@@ -175,6 +175,8 @@ enum NodeCmd {
     #[command(hide = true)]
     Facts,
     #[command(hide = true)]
+    Hashes,
+    #[command(hide = true)]
     Apply {
         #[arg(long)]
         dry_run: bool,
@@ -337,6 +339,7 @@ fn node_args(command: &NodeCmd) -> Option<Vec<String>> {
         NodeCmd::Install { .. } => return None,
         NodeCmd::Version => &["version"],
         NodeCmd::Facts => &["facts"],
+        NodeCmd::Hashes => &["hashes"],
         NodeCmd::Apply { dry_run: true } => &["apply", "--dry-run"],
         NodeCmd::Apply { dry_run: false } => &["apply"],
         NodeCmd::Account => &["account"],
