@@ -1,0 +1,41 @@
+Source: grantctl
+Section: admin
+Priority: optional
+Maintainer: Krushn Dayshmookh <krushndayshmookh@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc (>= 1.91),
+               librust-clap-4.5+derive-dev,
+               librust-clap-4.5+env-dev,
+               librust-serde-1+derive-dev,
+               librust-serde-json-dev
+Standards-Version: 4.7.0
+Homepage: https://github.com/nst-sdc/grantctl
+Vcs-Git: https://github.com/nst-sdc/grantctl.git
+Vcs-Browser: https://github.com/nst-sdc/grantctl
+Rules-Requires-Root: no
+
+Package: grantctl
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         openssh-server,
+         openssh-client,
+         sudo,
+         passwd
+Recommends: quota
+Description: cluster-wide user and access management from one file
+ grantctl manages Linux accounts, SSH access, sudo rights and resource limits
+ across a small Debian/Ubuntu cluster from a single source-of-truth file.
+ .
+ Each user is one line in access.conf, listing roles such as admin, student
+ or gpu, optionally scoped to nodes. grantctl runs on a control node and
+ reaches the other nodes over SSH; there is no daemon. On every node it
+ creates missing accounts, keeps group membership exact, writes its own
+ sshd_config.d, sudoers.d and limits.d files, and applies per-user slice
+ limits and disk quotas.
+ .
+ Changes are validated with visudo and sshd -t, backed up, and rolled back
+ on failure; access is only removed after the new rules are live.
+ .
+ Install this package on the control node and on every managed node.

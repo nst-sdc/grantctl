@@ -1,0 +1,22 @@
+[package]
+name = "grantctl"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.91"
+description = "Manage accounts, SSH, sudo and resource limits across a small Debian/Ubuntu cluster from one file"
+license = "MIT"
+repository = "https://github.com/nst-sdc/grantctl"
+readme = "README.md"
+keywords = ["sysadmin", "ssh", "sudo", "cluster", "access-control"]
+categories = ["command-line-utilities"]
+
+# Keep this list short: every crate here must be vendored or come from the
+# Ubuntu archive for the PPA build (Launchpad builders have no network).
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+strip = true
+lto = "thin"

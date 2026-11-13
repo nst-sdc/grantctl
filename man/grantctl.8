@@ -1,0 +1,286 @@
+.TH GRANTCTL 8 "November 2026" "grantctl 1.0.0" "System Administration"
+.SH NAME
+grantctl \- manage accounts, SSH, sudo and resource limits across a small cluster from one file
+.SH SYNOPSIS
+.B grantctl
+.RI [ options ]
+.I command
+.RI [ arguments ]
+.SH DESCRIPTION
+.B grantctl
+keeps the users of a small cluster in step with one file,
+.IR /etc/grantctl/access.conf .
+Each line names a user and the
+.I roles
+and
+.I flags
+the user holds, optionally limited to some nodes.
+.PP
+Run grantctl on the
+.B control node
+as yourself, not as root. It uses
+.BR sudo (8)
+on the control node and
+.BR ssh (1)
+followed by
+.B sudo \-n
+on the other nodes. There is no daemon. The same binary must be installed on every node (see
+.BR "NODE INSTALLATION" ).
+.PP
+On every node grantctl creates missing accounts, makes the membership of every role group exact,
+writes its own files in
+.IR sshd_config.d ,
+.I sudoers.d
+and
+.IR limits.d ,
+applies per-user systemd slice limits and disk quotas, and locks or unlocks accounts.
+Accounts that are not listed in access.conf are reported and never changed.
+.SH HOW A CHANGE IS APPLIED
+Every node is changed in the same order:
+.IP 1. 4
+.B Guards.
+A state that would remove the operator's sudo, or passwordless sudo on a node other than the
+control node, is refused before anything changes.
+.IP 2. 4
+.B Widen.
+Groups and accounts are created, memberships added, accounts unlocked. Nothing is removed.
+.IP 3. 4
+.B Switch.
+The sudoers, limits and sshd files are backed up and replaced. The new sudoers file is checked with
+.B visudo
+before it is installed and the whole tree after; the sshd files are checked with
+.B sshd \-t
+and sshd is reloaded. Any failure restores the backup and stops the run.
+.IP 4. 4
+.B Narrow.
+Only now are memberships removed and accounts locked.
+.IP 5. 4
+.B Limits.
+Slice limits and quotas.
+.PP
+If a run stops in step 3 the node has its old files and a superset of its old memberships:
+nobody who could log in before is locked out.
+.SH COMMANDS
+.SS Users
+.TP
+.BI "grant " "user token" "... [\-\-on " nodes "] [\-\-no\-sync]"
+Add roles or flags to a user, creating the line if needed, then sync.
+.TP
+.BI "revoke " user " [" token "...] [\-\-on " nodes "] [\-\-no\-sync]"
+Remove roles or flags. With
+.B \-\-on
+only on those nodes. Without any token the user is dropped from access.conf; with only
+.B \-\-on
+everything the user holds on those nodes is removed. The account itself is not deleted.
+.TP
+.BI "lock " user " [\-\-on " nodes "]"
+.TQ
+.BI "unlock " user " [\-\-on " nodes "]"
+Lock an account: the password and SSH keys stop working and running sessions are ended.
+.TP
+.BI "where " user
+Show the account on every node: locked or active, password state, keys, sessions, groups.
+.TP
+.BI "passwd " user " [\-\-on " nodes "] [\-\-from\-control]"
+Set one new temporary password on the user's nodes, with a forced change at next login. With
+.B \-\-from\-control
+copy the password the user has on the control node to the other nodes instead.
+.TP
+.BI "delete " user " [\-\-purge] [\-\-yes]"
+Delete the account on every node and remove it from access.conf.
+.B \-\-purge
+also removes the home directory, slice limits and quota record.
+.TP
+.BI "adopt " user " [\-\-yes]"
+Add an existing account to access.conf, drafted from its current state.
+.TP
+.BR prune " [" \-\-dry\-run ]
+Lock accounts that exist on nodes where the user has no access.
+.SS Cluster
+.TP
+.BI "init " "control\-node " [ node "...]"
+Write the configuration files and draft access.conf from the current state of the nodes.
+Nothing on the nodes changes. Entries that do not map onto a role are marked
+.BR review ;
+sync refuses to run until they are resolved.
+.TP
+.BR sync " [" \-\-dry\-run "] [" \fInode\fR ...]
+Make nodes match access.conf, control node first.
+.B \-\-dry\-run
+prints every change, including who gains and who loses SSH access, and changes nothing.
+The exit status is 1 when a node was unreachable or failed; the other nodes are still synced.
+.TP
+.BR audit " [" \fInode\fR ...]
+Read-only report of auth-related settings that grantctl does not manage: foreign sshd, sudoers
+and limits files, PAM settings, privileged groups, UIDs that differ between nodes.
+.TP
+.BR status " [" \fInode\fR ...]
+Members of the role groups and the owned files on each node.
+.TP
+.B check
+Validate the configuration without contacting any node.
+.TP
+.BI "plan " node " [\-\-json] [\-\-control\-ip " ip ]
+Show what a node should look like. Nothing is contacted.
+.TP
+.BR list ", " roles ", " version
+Print access.conf, the role table, or the version.
+.SH OPTIONS
+.TP
+.BI \-\-config\-dir " dir"
+Configuration directory. Default
+.IR /etc/grantctl ;
+also settable as
+.BR GRANTCTL_CONF .
+.TP
+.BI \-\-on " nodes"
+Comma separated node names. A suffix that matches exactly one node is enough
+.RB ( 3
+for
+.IR node3 ).
+.SH CONFIGURATION
+.TP
+.I /etc/grantctl/access.conf
+.nf
+<user>  <token> [token ...]   [# comment]
+.fi
+A token is a role, or a role limited to nodes
+.RB ( gpu@gpu1,node3 ),
+or a flag:
+.B locked
+(account locked),
+.B nopasswd
+(passwordless sudo where the user has sudo),
+.B pwonly
+(SSH keys refused). Flags can be limited to nodes too.
+.TP
+.I /etc/grantctl/roles.ini
+One section per role.
+.RS
+.TP 10
+.B groups
+Unix groups the role puts users in. Required.
+.TP
+.B nodes
+Default nodes:
+.B all
+or a list. A token
+.BI role@ node
+overrides it.
+.TP
+.B password
+.B yes
+allows SSH password login for the groups.
+.TP
+.B from
+.BR any ,
+.B control
+(only from the control node's addresses, the jump-host pattern), or a list of source addresses.
+.TP
+.B sshd
+Extra sshd options for the groups:
+.IR Key=Value,Key=Value .
+.TP
+.B sudo
+.B yes
+writes a sudoers rule for each group.
+.TP
+.B home
+Base directory for accounts created through the role.
+.TP
+.B slice
+systemd slice limits per user, for example
+.IR CPUQuota=800%,MemoryMax=20G .
+.TP
+.B quota
+Block quota per user on the filesystem holding
+.BR home ,
+for example
+.IR 90G .
+.TP
+.B limits
+pam_limits for the groups:
+.IR item=value,item=value .
+.RE
+.TP
+.I /etc/grantctl/nodes
+Node names, one per line, control node first.
+.TP
+.I /etc/grantctl/grantctl.conf
+Optional site settings:
+.BR CONTROL ,
+.BR SUDO_GROUP ,
+.BR SHELL_ROLE ,
+and
+.BR LEGACY_SSHD ", " LEGACY_SUDO ", " LEGACY_LIMITS ", " LEGACY_SLICE_MARKER ,
+which name files of earlier tooling that grantctl replaces on the first sync.
+.TP
+.I /etc/grantctl/sshd\-baseline
+Optional override of the global sshd settings written to every node.
+.SH PASSWORDS
+The control node is the source. A new account on another node receives the password hash the
+user has on the control node, so the password is the same everywhere. Each node remembers the
+hash grantctl last set. On a later sync, a password changed on the control node is copied to every
+node where the user has not changed it locally; a password changed on a node stays as it is.
+Accounts that existed before grantctl are not touched until
+.B grantctl passwd
+is used for them.
+.PP
+A user who is new everywhere gets a temporary password on the control node, printed once at the
+end of the sync, with a forced change at first login.
+.SH NODE INSTALLATION
+.TP
+.BI "grantctl node install " host ...
+Add the PPA
+.I ppa:nst\-sdc/grantctl
+on each host and install the package.
+.TP
+.BI "grantctl node install \-\-copy " host ...
+Copy the running binary to
+.I /usr/local/sbin/grantctl
+on each host instead, for hosts without internet access.
+.PP
+The operator needs SSH access and sudo on the host. After the first sync the operator needs the
+.B nopasswd
+flag on every node except the control node.
+.SH FILES
+.TP
+.I /etc/ssh/sshd_config.d/10\-grantctl.conf
+Global sshd settings and AllowGroups.
+.TP
+.I /etc/ssh/sshd_config.d/99\-grantctl.conf
+Match blocks: password login, source restrictions, per-group options.
+.TP
+.I /etc/sudoers.d/99\-grantctl
+The sudo group rule, role rules and NOPASSWD lines.
+.TP
+.I /etc/security/limits.d/60\-grantctl.conf
+pam_limits per group.
+.TP
+.I /etc/systemd/system/user\-UID.slice.d/50\-grantctl.conf
+Slice limits per user.
+.TP
+.I /var/backups/grantctl/
+Backups of the three configuration directories, one per change.
+.TP
+.I /var/lib/grantctl/
+Recorded quotas and password hashes set by grantctl (root only).
+.SH EXIT STATUS
+0 on success. 1 when the configuration is invalid, a node was unreachable, or a node refused or
+failed a change.
+.SH EXAMPLES
+.nf
+grantctl init node1 node2 node3 gpu1     # draft the roster from the nodes
+grantctl check && grantctl sync \-\-dry\-run
+grantctl grant maya student              # new user, default nodes of the role
+grantctl grant maya gpu \-\-on gpu1
+grantctl where maya
+grantctl revoke maya gpu
+grantctl lock maya
+.fi
+.SH SEE ALSO
+.BR sshd_config (5),
+.BR sudoers (5),
+.BR limits.conf (5),
+.BR systemd.resource\-control (5),
+.BR useradd (8)
