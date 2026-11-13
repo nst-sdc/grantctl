@@ -1,0 +1,25 @@
+name: rust
+on:
+  push:
+    branches: [rust]
+  pull_request:
+    branches: [rust]
+
+jobs:
+  stable:
+    name: fmt, clippy, tests (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  resolute:
+    name: tests with Ubuntu 26.04's own rustc
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq cargo rustc ca-certificates git
+      - uses: actions/checkout@v4
+      - run: rustc --version && cargo test

@@ -1,0 +1,114 @@
+=== node1
+accounts=alice:/home bob:/home carol:/home dave:/home erin:/home frank:/home heidi:/home judy:/home
+managed=alice bob carol dave erin frank gina heidi ivan judy kim
+locked=judy kim
+allow=cluster-users instructors ops students sudo
+group cluster-users=
+group gpu-users=
+group instructors=alice,bob,carol
+group lab-users=
+group ops=heidi
+group students=dave,erin,frank,judy
+group sudo=alice,bob
+slices=
+quotas=
+--- match
+Match User erin
+    PubkeyAuthentication no
+    PasswordAuthentication yes
+    AuthenticationMethods password
+Match Group cluster-users,instructors,students,sudo
+    PasswordAuthentication yes
+--- sudoers
+%sudo ALL=(ALL:ALL) ALL
+%ops ALL=(ALL:ALL) ALL
+alice ALL=(ALL:ALL) NOPASSWD: ALL
+heidi ALL=(ALL:ALL) NOPASSWD: ALL
+--- limits
+=== node2
+accounts=alice:/home bob:/home carol:/home heidi:/home ivan:/home
+managed=alice bob carol dave erin frank gina heidi ivan judy kim
+locked=judy kim
+allow=cluster-users instructors ops sudo
+group cluster-users=ivan
+group gpu-users=
+group instructors=alice,bob,carol
+group lab-users=
+group ops=heidi
+group students=
+group sudo=alice,bob
+slices=
+quotas=
+--- match
+Match Group cluster-users,instructors,sudo
+    PasswordAuthentication yes
+--- sudoers
+%sudo ALL=(ALL:ALL) ALL
+%ops ALL=(ALL:ALL) ALL
+alice ALL=(ALL:ALL) NOPASSWD: ALL
+bob ALL=(ALL:ALL) NOPASSWD: ALL
+heidi ALL=(ALL:ALL) NOPASSWD: ALL
+--- limits
+=== node3
+accounts=alice:/home bob:/home carol:/home frank:/srv/gpu-home gina:/home ivan:/home
+managed=alice bob carol dave erin frank gina heidi ivan judy kim
+locked=judy kim
+allow=cluster-users gpu-users instructors lab-users sudo
+group cluster-users=gina
+group gpu-users=frank
+group instructors=alice,bob,carol
+group lab-users=ivan
+group ops=
+group students=
+group sudo=alice,bob
+slices=frank:CPUQuota=800%,MemoryMax=20G,MemoryHigh=16G,TasksMax=1024
+quotas=frank:90G:/srv/gpu-home
+--- match
+Match Group cluster-users,gpu-users,instructors,sudo
+    PasswordAuthentication yes
+Match Group gpu-users
+    MaxSessions 4
+    AllowAgentForwarding no
+    X11Forwarding no
+Match Group gpu-users,!cluster-users,!instructors,!sudo Address *,!192.0.2.10,!192.0.2.11
+    DenyGroups gpu-users
+Match Group lab-users,!cluster-users,!instructors,!sudo Address *,!10.0.0.5,!10.0.0.6
+    DenyGroups lab-users
+--- sudoers
+%sudo ALL=(ALL:ALL) ALL
+alice ALL=(ALL:ALL) NOPASSWD: ALL
+bob ALL=(ALL:ALL) NOPASSWD: ALL
+--- limits
+@gpu-users hard nproc 1024
+@gpu-users hard maxlogins 4
+@gpu-users hard core 0
+=== gpu1
+accounts=alice:/home bob:/home carol:/home erin:/srv/gpu-home frank:/srv/gpu-home
+managed=alice bob carol dave erin frank gina heidi ivan judy kim
+locked=frank judy kim
+allow=cluster-users gpu-users instructors sudo
+group cluster-users=
+group gpu-users=erin,frank
+group instructors=alice,bob,carol
+group lab-users=
+group ops=
+group students=
+group sudo=alice,bob
+slices=erin:CPUQuota=800%,MemoryMax=20G,MemoryHigh=16G,TasksMax=1024 frank:CPUQuota=800%,MemoryMax=20G,MemoryHigh=16G,TasksMax=1024
+quotas=erin:90G:/srv/gpu-home frank:90G:/srv/gpu-home
+--- match
+Match Group cluster-users,gpu-users,instructors,sudo
+    PasswordAuthentication yes
+Match Group gpu-users
+    MaxSessions 4
+    AllowAgentForwarding no
+    X11Forwarding no
+Match Group gpu-users,!cluster-users,!instructors,!sudo Address *,!192.0.2.10,!192.0.2.11
+    DenyGroups gpu-users
+--- sudoers
+%sudo ALL=(ALL:ALL) ALL
+alice ALL=(ALL:ALL) NOPASSWD: ALL
+--- limits
+@gpu-users hard nproc 1024
+@gpu-users hard maxlogins 4
+@gpu-users hard core 0
