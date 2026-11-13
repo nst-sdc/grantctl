@@ -77,6 +77,17 @@ pub struct Quota {
     pub base: String,
 }
 
+/// A password to copy from the control node: the same password everywhere,
+/// unless the user changed it on this node themselves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Password {
+    pub user: String,
+    /// The shadow hash on the control node.
+    pub hash: String,
+    /// The shadow "last change" field there; `0` forces a change at next login.
+    pub last_change: String,
+}
+
 /// Files of other tools that grantctl replaces, removed only after its own
 /// files have been validated.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +127,10 @@ pub struct NodeDesired {
     pub limits: String,
     pub slices: Vec<Slice>,
     pub quotas: Vec<Quota>,
+    /// Passwords of the control node, for accounts on this node. Empty on
+    /// the control node itself. See `node::apply` for when one is applied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passwords: Vec<Password>,
     pub legacy: Legacy,
 }
 
@@ -127,6 +142,8 @@ pub struct Hints {
     /// UIDs and GIDs on the control node, reused on other nodes when free.
     pub uids: BTreeMap<String, u32>,
     pub gids: BTreeMap<String, u32>,
+    /// Usable password hashes on the control node: user -> (hash, last change).
+    pub passwords: BTreeMap<String, (String, String)>,
 }
 
 /// What `node` must look like.
@@ -356,6 +373,17 @@ pub fn build(cfg: &Config, node: &str, operator: &str, hints: &Hints) -> Result<
         quotas: quotas
             .into_iter()
             .map(|(user, (size, base))| Quota { user, size, base })
+            .collect(),
+        passwords: accounts
+            .iter()
+            .filter(|u| node != cfg.control() && !has_flag("locked", u))
+            .filter_map(|u| {
+                hints.passwords.get(u).map(|(hash, last_change)| Password {
+                    user: u.clone(),
+                    hash: hash.clone(),
+                    last_change: last_change.clone(),
+                })
+            })
             .collect(),
         legacy: Legacy {
             sshd: with(&V1_SSHD, &site.legacy_sshd),

@@ -1,7 +1,8 @@
 //! Node commands other than `apply`: facts, single-account operations, audit.
 
-use super::apply::{slice_dir, SLICE_ROOT, STATE_DIR};
+use super::apply::{set_password, slice_dir, SLICE_ROOT, STATE_DIR};
 use super::system::{self, Grp, System, User};
+use crate::desired::Password;
 use crate::desired::{LIMITS_DIR, LIMITS_FILE, SSHD_DIR, SSHD_MAIN_FILE, SSHD_MATCH_FILE};
 use crate::desired::{SUDOERS_DIR, SUDOERS_FILE};
 use crate::PROTOCOL;
@@ -185,9 +186,28 @@ pub struct AccountRequest {
     pub user: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// With `Passwd`: a shadow hash to set instead of a plain-text password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    /// With `Passwd`: force a change at the next login.
+    #[serde(default)]
+    pub must_change: bool,
     /// With `Delete`: also remove the home directory, slice limits and quota record.
     #[serde(default)]
     pub purge: bool,
+}
+
+impl AccountRequest {
+    pub fn new(op: AccountOp, user: &str) -> AccountRequest {
+        AccountRequest {
+            op,
+            user: user.to_string(),
+            password: None,
+            hash: None,
+            must_change: false,
+            purge: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,12 +235,12 @@ pub fn account(sys: &mut dyn System, req: &AccountRequest) -> AccountReply {
     let name = user.name.as_str();
     let result: Result<String, String> = match req.op {
         AccountOp::Where => Ok(String::new()),
-        AccountOp::Passwd => match &req.password {
-            None => Err("no password given".into()),
-            Some(password) => sys
-                .run(&["chpasswd"], Some(&format!("{name}:{password}\n")))
-                .and_then(|()| sys.run(&["chage", "-d", "0", name], None))
-                .map(|()| "password set, change forced at next login".into()),
+        AccountOp::Passwd => match (&req.hash, &req.password) {
+            (Some(hash), _) => set_password(sys, name, hash, true, req.must_change)
+                .map(|()| "password now matches the control node".into()),
+            (None, Some(password)) => set_password(sys, name, password, false, req.must_change)
+                .map(|()| "password set".into()),
+            (None, None) => Err("no password given".into()),
         },
         AccountOp::Lock => sys
             .run(&["usermod", "-L", "-e", "1", name], None)
@@ -269,6 +289,38 @@ fn delete(sys: &mut dyn System, user: &User, purge: bool) -> Result<String, Stri
         let _ = sys.write(&quota, &kept, 0o600);
     }
     Ok("deleted with home, slice limits and quota record".into())
+}
+
+// ---------------------------------------------------------------- password hashes
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HashesRequest {
+    pub users: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HashesReply {
+    pub passwords: Vec<Password>,
+}
+
+/// The usable password hashes of these users. Asked of the control node,
+/// whose passwords the other nodes follow. Accounts without a password, or
+/// with a locked one, are left out.
+pub fn hashes(sys: &dyn System, req: &HashesRequest) -> HashesReply {
+    let passwords = req
+        .users
+        .iter()
+        .filter_map(|user| {
+            let (hash, last_change, _) = system::shadow(sys, user)?;
+            let usable = hash.len() > 1 && !hash.starts_with('!') && !hash.starts_with('*');
+            usable.then(|| Password {
+                user: user.clone(),
+                hash,
+                last_change,
+            })
+        })
+        .collect();
+    HashesReply { passwords }
 }
 
 // ---------------------------------------------------------------- audit

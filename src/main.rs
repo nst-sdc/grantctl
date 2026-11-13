@@ -86,6 +86,10 @@ enum Cmd {
         user: String,
         #[command(flatten)]
         on: On,
+        /// Copy the password the user has on the control node to the other
+        /// nodes, instead of setting a new temporary one
+        #[arg(long)]
+        from_control: bool,
     },
     /// Delete an account on every node
     Delete {
@@ -299,7 +303,11 @@ fn run(cli: &Cli) -> Result<bool> {
         Cmd::Lock { user, on, no_sync } => control::lock(&mut ctx, user, true, &on.on, !no_sync),
         Cmd::Unlock { user, on, no_sync } => control::lock(&mut ctx, user, false, &on.on, !no_sync),
         Cmd::Where { user } => control::where_(&mut ctx, user),
-        Cmd::Passwd { user, on } => control::passwd(&mut ctx, user, &on.on),
+        Cmd::Passwd {
+            user,
+            on,
+            from_control,
+        } => control::passwd(&mut ctx, user, &on.on, *from_control),
         Cmd::Delete { user, purge, yes } => {
             ctx.yes = *yes;
             control::delete(&mut ctx, user, *purge)

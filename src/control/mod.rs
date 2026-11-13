@@ -6,6 +6,7 @@ pub mod transport;
 use crate::config::{Config, Token};
 use crate::desired::{self, Hints};
 use crate::node::ops::{AccountOp, AccountReply, AccountRequest, AuditReply, AuditRequest, Facts};
+use crate::node::ops::{HashesReply, HashesRequest};
 use crate::node::{Action, Report, Status, Version};
 use crate::{edit, validate, Error, Result, PROTOCOL};
 use serde::de::DeserializeOwned;
@@ -273,6 +274,9 @@ fn describe(action: &Action) -> String {
         }
         Action::AddMember { user, group } => format!("add {user} to {group}"),
         Action::Unlock { user } => format!("unlock {user}"),
+        Action::Password { user } => {
+            format!("set the password of {user} to the one on the control node")
+        }
         Action::Install { path, .. } => format!("install {path}"),
         Action::Remove { path, .. } => format!("remove {path}"),
         Action::RemoveMember { user, group } => format!("remove {user} from {group}"),
@@ -348,23 +352,83 @@ fn render(ctx: &mut Ctx, node: &str, r: &Report) {
 
 // ---------------------------------------------------------------- sync
 
+/// The usable password hashes on the control node. The other nodes follow
+/// them: one password everywhere, unless the user changed it on a node.
+fn control_passwords(
+    ctx: &mut Ctx,
+    control: &str,
+    users: &[String],
+) -> BTreeMap<String, (String, String)> {
+    let request = HashesRequest {
+        users: users.to_vec(),
+    };
+    match call::<HashesReply>(ctx, control, &["hashes"], &request) {
+        Ok(reply) => reply
+            .passwords
+            .into_iter()
+            .map(|p| (p.user, (p.hash, p.last_change)))
+            .collect(),
+        Err(e) => {
+            say!(
+                ctx,
+                "[{control}] WARN cannot read the passwords to copy: {e}"
+            );
+            BTreeMap::new()
+        }
+    }
+}
+
+fn set_temp_password(ctx: &mut Ctx, node: &str, user: &str, password: &str) -> bool {
+    let mut request = AccountRequest::new(AccountOp::Passwd, user);
+    request.password = Some(password.to_string());
+    request.must_change = true;
+    match call::<AccountReply>(ctx, node, &["account"], &request) {
+        Ok(reply) if reply.ok => true,
+        Ok(reply) => {
+            say!(
+                ctx,
+                "[{node}] FAILED: password for {user}: {}",
+                reply.message
+            );
+            false
+        }
+        Err(e) => {
+            say!(ctx, "[{node}] FAILED: password for {user}: {e}");
+            false
+        }
+    }
+}
+
 /// Make nodes match access.conf. Returns `false` when a node was skipped or
 /// failed; the others are still synced.
 pub fn sync(ctx: &mut Ctx, nodes: &[String], dry_run: bool) -> Result<bool> {
     let cfg = load_valid(ctx)?;
-    let hints = hints(ctx, &cfg);
-    let managed: BTreeSet<&str> = cfg.access.entries().map(|e| e.user.as_str()).collect();
-    // Who already has an account somewhere: on the control node, or on a
-    // node visited in this run.
-    let mut existed: BTreeSet<String> = hints.uids.keys().cloned().collect();
-    let mut created: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut hints = hints(ctx, &cfg);
+    let control = cfg.control().to_string();
+    let users: Vec<String> = cfg.access.entries().map(|e| e.user.clone()).collect();
+    // Who is entitled to an account on the control node.
+    let on_control: BTreeSet<String> = desired::build(&cfg, &control, &ctx.operator, &hints)?
+        .accounts
+        .into_iter()
+        .map(|a| a.user)
+        .collect();
+    let mut temporary: Vec<(String, String)> = Vec::new();
+    // Accounts created on other nodes with no password to copy: user -> nodes.
+    let mut without: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut failed: Vec<String> = Vec::new();
+    let mut have_passwords = false;
 
     for node in targets(&cfg, nodes)? {
         say!(ctx, "===== {node}");
         if !ready(ctx, &node) {
             failed.push(node);
             continue;
+        }
+        if node != control && !have_passwords {
+            // Read after the control node was synced, so that accounts
+            // created there in this run are included.
+            hints.passwords = control_passwords(ctx, &control, &users);
+            have_passwords = true;
         }
         let state = desired::build(&cfg, &node, &ctx.operator, &hints)?;
         let args: &[&str] = if dry_run {
@@ -381,59 +445,56 @@ pub fn sync(ctx: &mut Ctx, nodes: &[String], dry_run: bool) -> Result<bool> {
             }
         };
         render(ctx, &node, &report);
-        existed.extend(report.had_account.iter().cloned());
         if !report.ok {
             failed.push(node);
-        } else if !dry_run {
-            for user in &report.created {
-                created.entry(user.clone()).or_default().push(node.clone());
+            continue;
+        }
+        if dry_run {
+            continue;
+        }
+        for user in &report.created {
+            if node == control {
+                // New on the control node: a temporary password here. The
+                // other nodes copy it, so it is the same everywhere.
+                let password = temp_password()?;
+                if set_temp_password(ctx, &node, user, &password) {
+                    temporary.push((user.clone(), password));
+                }
+            } else if !hints.passwords.contains_key(user) {
+                without.entry(user.clone()).or_default().push(node.clone());
             }
         }
     }
 
-    // New accounts have no usable password. A brand-new user gets one
-    // temporary password on all their nodes; a user who already existed
-    // somewhere keeps their accounts separate and gets a hint instead.
-    let mut passwords: Vec<(String, String)> = Vec::new();
-    let mut hints_out: Vec<String> = Vec::new();
-    for (user, on) in &created {
-        if existed.contains(user) || !managed.contains(user.as_str()) {
-            hints_out.push(format!(
-                "{user}: new account on {} has no password yet (their other accounts are unchanged). Run: grantctl passwd {user} --on {}",
-                on.join(", "),
-                on.join(",")
+    let mut notes: Vec<String> = Vec::new();
+    for (user, on) in &without {
+        if on_control.contains(user) {
+            notes.push(format!(
+                "{user}: the new account on {} has no password, because there is none to copy from {control} yet. Sync {control} first, or run: grantctl passwd {user}",
+                on.join(", ")
             ));
             continue;
         }
+        // No account on the control node to follow: one temporary password
+        // for all of the user's new nodes.
         let password = temp_password()?;
+        let mut set = false;
         for node in on {
-            let request = AccountRequest {
-                op: AccountOp::Passwd,
-                user: user.clone(),
-                password: Some(password.clone()),
-                purge: false,
-            };
-            match call::<AccountReply>(ctx, node, &["account"], &request) {
-                Ok(reply) if reply.ok => {}
-                Ok(reply) => say!(
-                    ctx,
-                    "[{node}] FAILED: password for {user}: {}",
-                    reply.message
-                ),
-                Err(e) => say!(ctx, "[{node}] FAILED: password for {user}: {e}"),
-            }
+            set |= set_temp_password(ctx, node, user, &password);
         }
-        passwords.push((user.clone(), password));
+        if set {
+            temporary.push((user.clone(), password));
+        }
     }
-    if !passwords.is_empty() {
+    if !temporary.is_empty() {
         say!(ctx, "");
-        say!(ctx, "Temporary passwords (same on all of the user's new nodes, change forced at first login; share privately):");
-        for (user, password) in &passwords {
+        say!(ctx, "Temporary passwords (the same on every node of the user, change forced at first login; share privately):");
+        for (user, password) in &temporary {
             say!(ctx, "  {user:<16} {password}");
         }
     }
-    for hint in hints_out {
-        say!(ctx, "{hint}");
+    for note in notes {
+        say!(ctx, "{note}");
     }
     if !failed.is_empty() {
         say!(ctx, "");
@@ -538,7 +599,7 @@ pub fn lock(
     } else {
         AccountOp::Unlock
     };
-    account_everywhere(ctx, &cfg, &nodes, user, op, None, false)
+    account_everywhere(ctx, &cfg, &nodes, &AccountRequest::new(op, user))
 }
 
 // ---------------------------------------------------------------- single accounts
@@ -575,20 +636,11 @@ fn account_everywhere(
     ctx: &mut Ctx,
     cfg: &Config,
     nodes: &[String],
-    user: &str,
-    op: AccountOp,
-    password: Option<String>,
-    purge: bool,
+    request: &AccountRequest,
 ) -> Result<bool> {
-    let request = AccountRequest {
-        op,
-        user: user.to_string(),
-        password,
-        purge,
-    };
     let mut all_ok = true;
     for node in targets(cfg, nodes)? {
-        match call::<AccountReply>(ctx, &node, &["account"], &request) {
+        match call::<AccountReply>(ctx, &node, &["account"], request) {
             Ok(reply) => {
                 all_ok &= reply.ok;
                 say!(ctx, "[{node}] {}", show(&reply));
@@ -608,22 +660,41 @@ pub fn where_(ctx: &mut Ctx, user: &str) -> Result<bool> {
         Some(entry) => say!(ctx, "access.conf: {} {}", entry.user, entry.tokens_text()),
         None => say!(ctx, "access.conf: (not listed)"),
     }
-    account_everywhere(ctx, &cfg, &[], user, AccountOp::Where, None, false)
+    account_everywhere(ctx, &cfg, &[], &AccountRequest::new(AccountOp::Where, user))
 }
 
-pub fn passwd(ctx: &mut Ctx, user: &str, on: &Option<String>) -> Result<bool> {
+/// Give a user a new password on all (or the given) nodes.
+///
+/// Default: one new temporary password, change forced at next login.
+/// `from_control`: copy the password the user has on the control node to
+/// the other nodes instead, for a user whose passwords have drifted apart.
+pub fn passwd(ctx: &mut Ctx, user: &str, on: &Option<String>, from_control: bool) -> Result<bool> {
     let cfg = Config::load(&ctx.dir)?;
-    let nodes = on_nodes(&cfg, on)?.unwrap_or_default();
+    let control = cfg.control().to_string();
+    let nodes = on_nodes(&cfg, on)?.unwrap_or_else(|| cfg.nodes.clone());
+    let mut request = AccountRequest::new(AccountOp::Passwd, user);
+    if from_control {
+        let Some((hash, last_change)) =
+            control_passwords(ctx, &control, &[user.to_string()]).remove(user)
+        else {
+            return Err(Error::msg(format!(
+                "{user} has no usable password on {control}"
+            )));
+        };
+        request.hash = Some(hash);
+        request.must_change = last_change == "0";
+        let others: Vec<String> = nodes.into_iter().filter(|n| *n != control).collect();
+        if others.is_empty() {
+            return Err(Error::msg(
+                "nothing to do: --from-control copies to nodes other than the control node",
+            ));
+        }
+        return account_everywhere(ctx, &cfg, &others, &request);
+    }
     let password = temp_password()?;
-    let ok = account_everywhere(
-        ctx,
-        &cfg,
-        &nodes,
-        user,
-        AccountOp::Passwd,
-        Some(password.clone()),
-        false,
-    )?;
+    request.password = Some(password.clone());
+    request.must_change = true;
+    let ok = account_everywhere(ctx, &cfg, &nodes, &request)?;
     say!(ctx, "");
     say!(
         ctx,
@@ -658,7 +729,9 @@ pub fn delete(ctx: &mut Ctx, user: &str, purge: bool) -> Result<bool> {
         cfg.access.remove(user);
         commit(ctx, &cfg, user)?;
     }
-    account_everywhere(ctx, &cfg, &[], user, AccountOp::Delete, None, purge)
+    let mut request = AccountRequest::new(AccountOp::Delete, user);
+    request.purge = purge;
+    account_everywhere(ctx, &cfg, &[], &request)
 }
 
 /// Lock accounts that exist on a node where the user has no access.
@@ -693,12 +766,7 @@ pub fn prune(ctx: &mut Ctx, dry_run: bool) -> Result<bool> {
                 say!(ctx, "[{node}] would lock stray {user}");
                 continue;
             }
-            let request = AccountRequest {
-                op: AccountOp::Lock,
-                user: user.clone(),
-                password: None,
-                purge: false,
-            };
+            let request = AccountRequest::new(AccountOp::Lock, &user);
             match call::<AccountReply>(ctx, &node, &["account"], &request) {
                 Ok(reply) => say!(ctx, "[{node}] {user}: {}", reply.message),
                 Err(e) => {

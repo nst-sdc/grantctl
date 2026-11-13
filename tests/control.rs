@@ -186,7 +186,7 @@ fn a_new_user_gets_one_temporary_password_on_all_their_nodes() {
 }
 
 #[test]
-fn an_existing_user_gaining_a_node_gets_a_hint_not_a_password() {
+fn an_existing_user_gaining_a_node_has_the_same_password_there() {
     let lab = Lab::new("hint", Some(ACCESS));
     lab.sync();
     let before = lab.cluster.with("node1", |s| s.users["carol"].hash.clone());
@@ -198,12 +198,72 @@ fn an_existing_user_gaining_a_node_gets_a_hint_not_a_password() {
         "{}",
         lab.access()
     );
-    assert!(out.contains("grantctl passwd carol --on node2"), "{out}");
+    assert!(
+        out.contains("[node2] set the password of carol to the one on the control node"),
+        "{out}"
+    );
     assert!(!out.contains("Temporary passwords"), "{out}");
     lab.cluster
-        .with("node2", |s| assert_eq!(s.users["carol"].hash, "!"));
+        .with("node2", |s| assert_eq!(s.users["carol"].hash, before));
     lab.cluster
         .with("node1", |s| assert_eq!(s.users["carol"].hash, before));
+    // carol has not changed her temporary password yet: still forced here too.
+    lab.cluster
+        .with("node2", |s| assert_eq!(s.users["carol"].last_change, "0"));
+}
+
+#[test]
+fn passwords_follow_the_control_node_unless_changed_on_a_node() {
+    let lab = Lab::new("follow", Some(ACCESS));
+    lab.sync();
+    let hash = |node: &str, user: &str| lab.cluster.with(node, |s| s.users[user].hash.clone());
+    let change = |node: &str, user: &str, to: &str| {
+        lab.cluster.with(node, |s| {
+            let u = s.users.get_mut(user).unwrap();
+            u.hash = to.to_string();
+            u.last_change = "20001".into();
+        })
+    };
+    change("node1", "bob", "$new$bob"); // bob sets his own password on the control node
+    change("node1", "dave", "$new$dave"); // so does dave ...
+    change("gpu1", "dave", "$own$gpu"); // ... who also set a different one on gpu1 himself
+    change("node1", "alice", "$new$alice"); // alice's accounts predate grantctl
+
+    let (_, out) = lab.run(|c| control::sync(c, &[], true));
+    assert!(
+        out.contains("[node2] would: set the password of bob to the one on the control node"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("password of dave") && !out.contains("password of alice"),
+        "{out}"
+    );
+
+    assert!(lab.sync().0);
+    assert_eq!(hash("node2", "bob"), "$new$bob");
+    assert_eq!(hash("gpu1", "bob"), "$new$bob");
+    lab.cluster
+        .with("node2", |s| assert_ne!(s.users["bob"].last_change, "0"));
+    assert_eq!(
+        hash("gpu1", "dave"),
+        "$own$gpu",
+        "a password changed on a node stays"
+    );
+    assert_eq!(
+        hash("node2", "alice"),
+        "$y$fake",
+        "passwords grantctl never set are not touched"
+    );
+
+    let before = lab.mutations();
+    assert!(lab.sync().0);
+    assert_eq!(lab.mutations(), before);
+
+    // The operator can bring a drifted account back in line explicitly.
+    let (ok, out) = lab.run(|c| control::passwd(c, "dave", &None, true));
+    assert!(ok.unwrap(), "{out}");
+    assert_eq!(hash("gpu1", "dave"), "$new$dave");
+    assert_eq!(hash("node1", "dave"), "$new$dave");
 }
 
 #[test]
@@ -350,7 +410,7 @@ fn passwd_where_delete_and_prune() {
     let lab = Lab::new("ops", Some(ACCESS));
     lab.sync();
 
-    let (ok, out) = lab.run(|c| control::passwd(c, "dave", &None));
+    let (ok, out) = lab.run(|c| control::passwd(c, "dave", &None, false));
     assert!(ok.unwrap(), "{out}");
     let printed = out
         .lines()

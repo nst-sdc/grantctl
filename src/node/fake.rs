@@ -340,11 +340,21 @@ impl System for FakeSystem {
                 }
                 user.hash.remove(0);
             }
+            ["chpasswd", "-e"] => {
+                let (name, hash) = stdin
+                    .and_then(|s| s.trim().split_once(':'))
+                    .ok_or("chpasswd: bad input")?;
+                let user = self.user_mut(name)?;
+                user.hash = hash.to_string();
+                user.last_change = "20000".into();
+            }
             ["chpasswd"] => {
                 let (name, password) = stdin
                     .and_then(|s| s.trim().split_once(':'))
                     .ok_or("chpasswd: bad input")?;
-                self.user_mut(name)?.hash = format!("$fake${password}");
+                let user = self.user_mut(name)?;
+                user.hash = format!("$fake${password}");
+                user.last_change = "20000".into();
             }
             ["chage", "-d", "0", name] => self.user_mut(name)?.last_change = "0".into(),
             ["userdel", rest @ ..] => {

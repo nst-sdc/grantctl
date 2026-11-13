@@ -26,6 +26,10 @@ pub const BACKUP_DIR: &str = "/var/backups/grantctl";
 pub const STATE_DIR: &str = "/var/lib/grantctl";
 pub const SLICE_ROOT: &str = "/etc/systemd/system";
 const QUOTA_STATE: &str = "/var/lib/grantctl/quota";
+/// `user hash` per line: the password hash grantctl last set on this node.
+/// While the account still has that hash, the user has not changed the
+/// password here themselves, and a newer one may be copied in.
+const PASSWORD_STATE: &str = "/var/lib/grantctl/passwords";
 /// Where nst-cockpit (v1) recorded the quotas it had applied.
 const V1_QUOTA_STATE: &str = "/var/lib/nst-cockpit/quota";
 
@@ -255,6 +259,29 @@ fn plan(sys: &dyn System, d: &NodeDesired, r: &mut Report) -> Result<(), String>
             && system::is_locked(sys, name);
         if unlock {
             push(Phase::Widen, Action::Unlock { user: name.clone() });
+        }
+    }
+    // Passwords follow the control node: always for a new account, and for
+    // an existing one only while it still has the password grantctl set.
+    let recorded = sys.read(PASSWORD_STATE).unwrap_or_default();
+    for p in &d.passwords {
+        let copy = match user(&p.user) {
+            None => true,
+            Some(_) => {
+                let current = system::shadow(sys, &p.user).unwrap_or_default().0;
+                current != p.hash
+                    && recorded
+                        .lines()
+                        .any(|l| l.split_once(' ') == Some((p.user.as_str(), current.as_str())))
+            }
+        };
+        if copy {
+            push(
+                Phase::Widen,
+                Action::Password {
+                    user: p.user.clone(),
+                },
+            );
         }
     }
 
@@ -507,6 +534,14 @@ fn act(sys: &mut dyn System, d: &NodeDesired, action: &Action) -> Result<(), Str
             let _ = sys.run(&["usermod", "-U", user], None);
             Ok(())
         }
+        Action::Password { user } => {
+            let p = d
+                .passwords
+                .iter()
+                .find(|p| &p.user == user)
+                .ok_or_else(|| format!("no password given for {user}"))?;
+            set_password(sys, user, &p.hash, true, p.last_change == "0")
+        }
         Action::Lock { user } => {
             sys.run(&["usermod", "-L", "-e", "1", user], None)?;
             let _ = sys.run(&["pkill", "-KILL", "-u", user], None);
@@ -562,6 +597,38 @@ fn act(sys: &mut dyn System, d: &NodeDesired, action: &Action) -> Result<(), Str
             sys.write(QUOTA_STATE, &state, 0o600)
         }
     }
+}
+
+/// Set a password (`encrypted`: `secret` is a shadow hash, otherwise plain
+/// text), optionally force a change at next login, and remember the
+/// resulting hash as the one grantctl set.
+pub fn set_password(
+    sys: &mut dyn System,
+    user: &str,
+    secret: &str,
+    encrypted: bool,
+    must_change: bool,
+) -> Result<(), String> {
+    // On stdin, so the secret never shows up in a process list.
+    let argv: &[&str] = if encrypted {
+        &["chpasswd", "-e"]
+    } else {
+        &["chpasswd"]
+    };
+    sys.run(argv, Some(&format!("{user}:{secret}\n")))?;
+    if must_change {
+        sys.run(&["chage", "-d", "0", user], None)?;
+    }
+    let hash = system::shadow(sys, user).unwrap_or_default().0;
+    let mut state: String = sys
+        .read(PASSWORD_STATE)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.starts_with(&format!("{user} ")))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    state.push_str(&format!("{user} {hash}\n"));
+    sys.write(PASSWORD_STATE, &state, 0o600)
 }
 
 /// Replace the owned files. On any failure the three directories are

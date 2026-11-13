@@ -46,6 +46,11 @@ pub enum Action {
     Unlock {
         user: String,
     },
+    /// Set the password to the control node's. The hash itself is in the
+    /// desired state, never in a report.
+    Password {
+        user: String,
+    },
     Install {
         path: String,
         mode: u32,
@@ -153,6 +158,10 @@ pub fn handle(sys: &mut dyn System, args: &[String], stdin: &str) -> Result<Stri
             to_json(&apply::apply(sys, &desired, dry_run))
         }
         "facts" => to_json(&ops::facts(sys)),
+        "hashes" => {
+            let request: ops::HashesRequest = from_json("the user list", stdin)?;
+            to_json(&ops::hashes(sys, &request))
+        }
         "account" => {
             let request: ops::AccountRequest = from_json("the account request", stdin)?;
             to_json(&ops::account(sys, &request))
