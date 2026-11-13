@@ -2,17 +2,20 @@
 //!
 //! The crate is split in two halves that talk JSON over SSH:
 //!
-//! * the control side (this milestone): configuration, validation, token
-//!   editing and the per-node desired state, all pure and unit-tested;
-//! * the node side (`grantctl node ...`, later milestones): compares the
-//!   desired state with the machine and applies the difference.
+//! * the control side: configuration, validation, token editing and the
+//!   per-node desired state (pure and unit-tested), plus the commands that
+//!   reach nodes over SSH (`control`);
+//! * the node side (`grantctl node ...`): compares the desired state with
+//!   the machine and applies the difference (`node`).
 //!
 //! See `docs/DESIGN.md`.
 
 pub mod config;
+pub mod control;
 pub mod desired;
 pub mod edit;
 pub mod error;
+pub mod node;
 pub mod validate;
 
 pub use error::{Error, Result};
