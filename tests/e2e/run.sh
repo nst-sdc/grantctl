@@ -40,6 +40,8 @@ for n in $NODES; do docker run -d --name "$n" --hostname "$n" --network "$NET" g
 
 root() { local n=$1; shift; docker exec "$n" "$@"; }
 ctl()  { docker exec -u op -e USER=op -e HOME=/home/op gt-ctl "$@"; }
+# The same with stdin attached, for here-documents.
+ctl_in() { docker exec -i -u op -e USER=op -e HOME=/home/op gt-ctl "$@"; }
 # Run grantctl on the control node as the operator; capture output and exit code.
 G() { OUT=$(ctl grantctl "$@" 2>&1); RC=$?; }
 members() { root "$1" getent group "$2" | cut -d: -f4; }
@@ -67,7 +69,7 @@ G node install --copy gt-n2 gt-gpu;     is  "node install --copy: exit code" "$R
 has "node install: version check over SSH" "$OUT" "[gt-gpu] grantctl "
 
 echo "== configuration"
-ctl sudo tee /etc/grantctl/roles.ini >/dev/null <<'ROLES'
+ctl_in sudo tee /etc/grantctl/roles.ini >/dev/null <<'ROLES'
 [admin]
 groups   = gt-staff,sudo
 password = yes
@@ -83,7 +85,7 @@ from     = control
 home     = /srv/gpu-home
 slice    = CPUQuota=200%
 ROLES
-ctl sudo tee /etc/grantctl/access.conf >/dev/null <<'ROSTER'
+ctl_in sudo tee /etc/grantctl/access.conf >/dev/null <<'ROSTER'
 op     admin nopasswd
 bob    admin
 carol  student
