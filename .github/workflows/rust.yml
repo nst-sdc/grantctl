@@ -49,7 +49,8 @@ jobs:
       - run: mk-build-deps -i -r -t 'apt-get -y -qq --no-install-recommends' debian/control
       # No network from here on: the build must not download anything.
       - run: unshare -n true 2>/dev/null && unshare -n dpkg-buildpackage -us -uc -b || dpkg-buildpackage -us -uc -b
-      - run: dpkg -c ../grantctl_*.deb && apt-get install -y -qq ../grantctl_*.deb && grantctl version && test -f /usr/share/man/man8/grantctl.8.gz
+      # Docker images drop man pages at install time, so check the package content instead.
+      - run: dpkg -c ../grantctl_*.deb | grep -q man8/grantctl.8.gz && apt-get install -y -qq ../grantctl_*.deb && grantctl version
       - run: lintian --no-tag-display-limit ../grantctl_*.deb || true
       - run: mkdir -p out && cp ../grantctl_*.deb out/
       - uses: actions/upload-artifact@v4
