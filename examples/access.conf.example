@@ -1,0 +1,10 @@
+# Example access.conf (fictional users). One user per line:
+#   <user> <token> [token..]   [# comment]
+#   token: role | role@node,node | locked | nopasswd | pwonly (flags can be @scoped too)
+
+alice            admin nopasswd          # operator: runs nst-cockpit, needs nopasswd on the workers
+bob              admin
+carol            student
+dave             student gpu             # jump host + GPU box (via jump host only)
+erin             student user@node3      # jump host + a shell on node3
+frank            student locked          # suspended

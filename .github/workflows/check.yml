@@ -1,0 +1,13 @@
+name: check
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck groff-base mawk gawk
+      - run: make lint
+      - name: tests (mawk)
+        run: mkdir -p /tmp/m && ln -sf "$(command -v mawk)" /tmp/m/awk && PATH=/tmp/m:$PATH tests/run.sh
+      - name: tests (gawk)
+        run: mkdir -p /tmp/g && ln -sf "$(command -v gawk)" /tmp/g/awk && PATH=/tmp/g:$PATH tests/run.sh

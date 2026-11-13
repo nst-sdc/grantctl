@@ -1,0 +1,758 @@
+#!/usr/bin/env bash
+# nst-cockpit : cluster-wide user + auth management for Debian/Ubuntu nodes
+# https://github.com/nst-sdc/nst-cockpit        docs: man nst-cockpit
+#
+# One control node holds the source of truth in $CONF_DIR (default /etc/nst-cockpit):
+#   access.conf    <user> <token> [token..]  [# comment]
+#                  token = role | role@node[,node] | flag | flag@node[,node]
+#                  flags: locked, nopasswd (sudo without password), pwonly (password-only SSH)
+#   roles.ini      what each role means (groups, nodes, password, source IPs, sshd opts,
+#                  sudo, home base, systemd slice limits, disk quota, pam limits)
+#   nodes          node list, one per line (SSH host names as seen from the control node)
+#   cockpit.conf   optional site settings (shell syntax): CONTROL, SUDO_GROUP, LEGACY_*
+#   sshd-baseline  optional override for the global sshd settings
+#
+# Owns on every node (and nothing else):
+#   /etc/ssh/sshd_config.d/10-nst-cockpit.conf, 99-nst-cockpit.conf
+#   /etc/sudoers.d/10-nst-cockpit
+#   /etc/security/limits.d/60-nst-cockpit.conf
+#   /etc/systemd/system/user-<uid>.slice.d/50-nst-limits.conf
+#   membership of every group named in roles.ini, account lock state, quotas
+#
+# Run on the control node as yourself. Needs your SSH key + passwordless sudo on the other nodes.
+set -euo pipefail
+VERSION=1.0.0
+
+CONF_DIR=${NST_COCKPIT_CONF:-/etc/nst-cockpit}
+ACCESS=$CONF_DIR/access.conf
+ROLES_FILE=$CONF_DIR/roles.ini
+NODES_FILE=$CONF_DIR/nodes
+SITE_FILE=$CONF_DIR/cockpit.conf
+BASELINE_FILE=$CONF_DIR/sshd-baseline
+FLAGS="locked nopasswd pwonly"
+
+# site settings (override in cockpit.conf)
+CONTROL=""            # control node name; default: first line of the nodes file
+SUDO_GROUP=sudo       # group granted "%group ALL=(ALL:ALL) ALL" by the distro (sudo on Debian/Ubuntu)
+SHELL_ROLE=user       # role init uses for plain SSH access found outside other roles
+LEGACY_SSHD=""        # files in sshd_config.d replaced by nst-cockpit (removed after validation)
+LEGACY_SUDO=""        # files in sudoers.d replaced by nst-cockpit
+LEGACY_LIMITS=""      # files in limits.d replaced by nst-cockpit
+LEGACY_SLICE_MARKER="" # regex: foreign slice drop-ins nst-cockpit may take over or remove
+LEGACY_MANAGERS=""    # old scripts audit should warn about
+# shellcheck disable=SC1090
+[ -r "$SITE_FILE" ] && . "$SITE_FILE"
+
+DEFAULT_ROLES='# nst-cockpit roles. One [section] per role. Keys (defaults in brackets):
+#   groups    unix groups the role puts users in (comma list)            [required]
+#   nodes     default nodes: all | node,node  (token role@node overrides)   [all]
+#   password  yes = password SSH login allowed for these groups              [no]
+#   from      any | control | ip,ip = SSH only from these source IPs        [any]
+#             control = the control node'"'"'s addresses (jump-host pattern)
+#   sshd      extra sshd options for these groups: Key=Val,Key=Val          [-]
+#   sudo      yes = "%group ALL=(ALL:ALL) ALL" for each group                [no]
+#   home      base dir for NEW accounts created through this role            [/home]
+#   slice     systemd per-user slice limits: Key=Val,..                      [-]
+#   quota     block quota per user on the filesystem holding home, e.g. 90G  [-]
+#   limits    pam_limits for the group: item=value,..                        [-]
+
+[admin]        # SSH + sudo everywhere
+groups   = cluster-admins,sudo
+
+[user]         # plain shell access. Typical: user@node3
+groups   = cluster-users
+
+# More examples (uncomment and adapt):
+#
+# [student]    # password login on the control node only
+# groups   = students
+# nodes    = node1
+# password = yes
+#
+# [gpu]        # GPU node: reachable only via the control node, with limits
+# groups   = gpu-users
+# nodes    = gpu1
+# from     = control
+# sshd     = MaxSessions=4,AllowAgentForwarding=no,X11Forwarding=no
+# home     = /srv/gpu-home
+# slice    = CPUQuota=800%,MemoryMax=20G,MemoryHigh=16G,TasksMax=1024
+# quota    = 90G
+# limits   = nproc=1024,maxlogins=4,core=0
+'
+DEFAULT_BASELINE='PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+PermitUserEnvironment no
+MaxAuthTries 4
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 3'
+
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=5)
+ME=${SUDO_USER:-${USER:-$(id -un)}}
+SELF=$(hostname)
+declare -A GIDMAP=()
+
+die(){ echo "nst-cockpit: $*" >&2; exit 1; }
+usage(){ cat >&2 <<'EOF'
+usage: nst-cockpit <command>
+ access (edit access.conf, then sync)        --on node3,node4 scopes the change
+  grant  <user> token.. [--on nodes]     e.g. grant rahul user --on node3
+  revoke <user> [token..] [--on nodes]   no token = drop user from access.conf (account kept)
+  lock | unlock <user> [--on nodes]
+ accounts (direct, all nodes)
+  where  <user>                 state per node
+  passwd <user> [--on nodes]    random temp password, forced change
+  delete <user> [--purge]       delete account everywhere (--purge removes home, slice, quota)
+  adopt  <user>                 add an existing account to access.conf from its current state
+  prune  [--dry-run]            lock accounts that exist on nodes where the user has no access
+ cluster
+  init <control> [node..]       write config, draft access.conf from current state (no node changes)
+  sync [--dry-run] [node..]     make nodes match access.conf
+  audit [node..]                read-only report of every auth-related setting
+  status [node..] | list | roles
+ short node names work when unambiguous (3 -> node3)
+ nst-cockpit version | full docs: man nst-cockpit
+EOF
+exit 1; }
+
+
+# ---------------------------------------------------------------- helpers
+all_nodes(){ [ -s "$NODES_FILE" ] || die "no nodes configured ($NODES_FILE). Run: nst-cockpit init <control-node> <node>..."
+  grep -vE '^\s*(#|$)' "$NODES_FILE" | awk '{print $1}' | tr '\n' ' '; }
+norm_node(){ local n m; [ -s "$NODES_FILE" ] || { echo "$1"; return; }
+  for n in $(all_nodes); do [ "$n" = "$1" ] && { echo "$1"; return; }; done
+  m=$(for n in $(all_nodes); do case "$n" in *"$1") echo "$n";; esac; done)
+  if [ "$(echo "$m" | grep -c .)" = 1 ]; then echo "$m"; else echo "$1"; fi; }
+norm_nodes(){ local n o=""; for n in ${1//,/ }; do o+="${o:+,}$(norm_node "$n")"; done; echo "$o"; }
+nodes(){ local n; if [ $# -gt 0 ]; then for n in "$@"; do norm_node "$n"; done | tr '\n' ' '; else all_nodes; fi; }
+n1_first(){ local h; for h in "$@"; do [ "$h" = "$SELF" ] && echo "$h"; done; for h in "$@"; do [ "$h" = "$SELF" ] || echo "$h"; done; }
+reachable(){ [ "$1" = "$SELF" ] || "${SSH[@]}" "$1" true 2>/dev/null; }
+run_root(){ if [ "$1" = "$SELF" ]; then sudo bash -s <<<"$2"; else "${SSH[@]}" "$1" 'sudo -n bash -s' <<<"$2"; fi; }
+vars(){ local v; for v in "$@"; do printf '%s=%q\n' "$v" "${!v}"; done; }
+newpass(){ openssl rand -base64 18 | tr -d '/+=\n' | cut -c1-14; }
+need_access(){ [ -f "$ACCESS" ] || die "$ACCESS missing, run: nst-cockpit init"; }
+users_in_conf(){ awk '{l=$0; sub(/#.*/,"",l); if (split(l,a)) print a[1]}' "$ACCESS" | tr '\n' ' '; }
+in_conf(){ users_in_conf | tr ' ' '\n' | grep -qx "$1"; }
+write_file(){ sudo install -d -m 0755 "$CONF_DIR"; sudo install -m 0644 "$1" "$2"; rm -f "$1"; }
+valid_user(){ [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || die "invalid username: $1"; }
+on_nodes(){ # payload node.. -> root on each reachable node
+  local p=$1 h; shift
+  for h in $(n1_first "$@"); do
+    if reachable "$h"; then run_root "$h" "$p" || echo "[$h] FAILED"; else echo "[$h] UNREACHABLE (rerun later)"; fi
+  done; }
+
+require_control(){
+  [ -n "$CONTROL" ] || CONTROL=$(all_nodes | awk '{print $1}')
+  [ "$SELF" = "$CONTROL" ] || [ "$(norm_node "$SELF")" = "$CONTROL" ] || die "run this on the control node ($CONTROL), not $SELF"
+  SELF=$CONTROL; }
+control_ips(){ local dev; dev=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+  if [ -n "$dev" ]; then ip -o addr show dev "$dev" scope global | awk '{sub(/\/.*/,"",$4); print $4}'; else hostname -I | tr ' ' '\n'; fi | grep -v '^$' | paste -sd, -; }
+
+# roles.ini -> TSV: role groups nodes password from sshd sudo home slice quota limits
+roles_tsv(){ { if [ -f "$ROLES_FILE" ]; then cat "$ROLES_FILE"; else printf '%s' "$DEFAULT_ROLES"; fi; } | awk '
+  function reset(){ split("",F); F["nodes"]="all"; F["password"]="no"; F["from"]="any"; F["sshd"]="-"; F["sudo"]="no"
+                    F["home"]="/home"; F["slice"]="-"; F["quota"]="-"; F["limits"]="-"; F["groups"]="" }
+  function flush(){ if (r!="") printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", r, F["groups"], F["nodes"], F["password"], F["from"], F["sshd"], F["sudo"], F["home"], F["slice"], F["quota"], F["limits"] }
+  { sub(/[ \t]*#.*/,"") } /^[ \t]*$/ { next }
+  /^[ \t]*\[.*\][ \t]*$/ { flush(); r=$0; gsub(/[][ \t]/,"",r); reset(); next }
+  { k=$0; sub(/=.*/,"",k); gsub(/[ \t]/,"",k); v=$0; sub(/^[^=]*=/,"",v); gsub(/^[ \t]+|[ \t]+$/,"",v); gsub(/[ \t]/,"",v); F[k]=v }
+  END { flush() }'; }
+role_names(){ roles_tsv | cut -f1 | tr '\n' ' '; }
+role_groups(){ roles_tsv | cut -f2 | tr ',' '\n' | sort -u | tr '\n' ' '; }
+role_defaults(){ roles_tsv | awk -F'\t' '{printf "%s=%s ", $1, $3}'; }
+check_roles(){ local bad; bad=$(roles_tsv | awk -F'\t' '$2=="" {print $1": no groups"} $4!~/^(yes|no)$/ {print $1": password must be yes|no"} $7!~/^(yes|no)$/ {print $1": sudo must be yes|no"}')
+  [ -z "$bad" ] || die "roles.ini: $bad"; }
+
+validate(){
+  need_access; check_roles
+  local errs
+  errs=$(awk -v ROLES="$(role_names)" -v FLAGS="$FLAGS" -v NODES="$(all_nodes)" -v ME="$ME" -v SELF="$SELF" -v DEFS="$(role_defaults)" '
+    function inn(list,node,  a,n,k){ if(list=="all") return 1; n=split(list,a,","); for(k=1;k<=n;k++) if(a[k]==node) return 1; return 0 }
+    BEGIN { n=split(ROLES,x," "); for(i=1;i<=n;i++) R[x[i]]=1; n=split(FLAGS,x," "); for(i=1;i<=n;i++) FL[x[i]]=1
+            n=split(NODES,x," "); for(i=1;i<=n;i++) N[x[i]]=1; NN=NODES
+            n=split(DEFS,x," "); for(i=1;i<=n;i++){ split(x[i],kv,"="); D[kv[1]]=kv[2] } }
+    { l=$0; sub(/#.*/,"",l); k=split(l,a); if(!k) next; u=a[1]; roles=0
+      if (u !~ /^[A-Za-z_][A-Za-z0-9_.-]*$/) print "  invalid username: " u
+      if (seen[u]++) print "  duplicate user: " u
+      for(j=2;j<=k;j++){ t=a[j]; if (t=="review") { print "  " u ": unresolved review"; continue }
+        r=t; s=""; p=index(t,"@"); if(p){ r=substr(t,1,p-1); s=substr(t,p+1) }
+        if (!(r in R) && !(r in FL)) { print "  " u ": unknown role/flag " r; continue }
+        if (r in R) roles++
+        if (s!="") { q=split(s,sn,","); for(y=1;y<=q;y++) if(!(sn[y] in N)) print "  " u ": unknown node " sn[y] }
+        if (u==ME) { if (t=="admin") meadmin=1; if (r=="locked") print "  you (" ME ") are marked locked" } }
+      if (!roles && l !~ /(^|[ \t])locked(@|[ \t]|$)/) print "  " u ": no role (give one, or mark locked, or delete the account)" }
+    END { if (!meadmin) print "  you (" ME ") need an unscoped admin token" }' "$ACCESS")
+  [ -z "$errs" ] || die "fix $ACCESS first:"$'\n'"$errs"
+}
+
+check_tokens(){ local t r s n
+  for t in "$@"; do
+    r=${t%%@*}
+    { role_names; echo " $FLAGS"; } | tr ' ' '\n' | grep -qx "$r" || die "unknown role/flag: $r (see: nst-cockpit roles)"
+    if [[ "$t" == *@* ]]; then s=${t#*@}; for n in ${s//,/ }; do all_nodes | tr ' ' '\n' | grep -qx "$n" || die "unknown node: $n"; done; fi
+  done; }
+
+# edit one user's tokens. add: union scopes; del: subtract scopes (no scope = drop token; no tokens = drop user)
+edit_tokens(){ # add|del user on(csv or "") tokens..
+  local mode=$1 u=$2 on=$3 tmp; shift 3; tmp=$(mktemp)
+  awk -v MODE="$mode" -v U="$u" -v ON="$on" -v TOK="$*" -v ALL="$(all_nodes | tr ' ' ',' | sed 's/,$//')" \
+      -v DEFS="$(role_defaults)" -v FLAGS="$FLAGS" -v STAMP="$(date +%F) by $ME" '
+    function expand(r,s){ if (s=="") s=DEF[r]; return (s=="all") ? ALL : s }
+    function toset(csv,S,  a,n,i){ split("",S); n=split(csv,a,","); for(i=1;i<=n;i++) S[a[i]]=1 }
+    function canon(r,S,  a,n,i,out){ out=""; n=split(ALL,a,","); for(i=1;i<=n;i++) if(a[i] in S) out=out (out==""?"":",") a[i]
+      if (out=="") return ""; return (out==DEFC[r]) ? r : r "@" out }
+    BEGIN { n=split(DEFS,x," "); for(i=1;i<=n;i++){ split(x[i],kv,"="); DEF[kv[1]]=kv[2] }
+            n=split(FLAGS,x," "); for(i=1;i<=n;i++) DEF[x[i]]="all"
+            for (r in DEF) { toset(expand(r,""),T); DEFC[r]=""; m=split(ALL,a,","); for(i=1;i<=m;i++) if(a[i] in T) DEFC[r]=DEFC[r] (DEFC[r]==""?"":",") a[i] }
+            nq=split(TOK,Q," ") }
+    { line=$0; c=""; i=index(line,"#"); if(i){ c=substr(line,i); line=substr(line,1,i-1) }
+      m=split(line,a); if (!m || a[1]!=U) { print; next }
+      found=1; ne=0; split("",E); split("",ES)
+      for(j=2;j<=m;j++){ t=a[j]; r=t; s=""; p=index(t,"@"); if(p){ r=substr(t,1,p-1); s=substr(t,p+1) }
+        if (!(r in ES)) { E[++ne]=r; ES[r]="" } ES[r]=ES[r] (ES[r]==""?"":",") expand(r,s) }
+      if (MODE=="del" && nq==0 && ON=="") next
+      if (MODE=="del" && nq==0) { nq=ne; for(k=1;k<=ne;k++) Q[k]=E[k] }
+      for(k=1;k<=nq;k++){ t=Q[k]; r=t; s=""; p=index(t,"@"); if(p){ r=substr(t,1,p-1); s=substr(t,p+1) }
+        if (ON!="") s=ON
+        if (MODE=="add") { if (!(r in ES)) { E[++ne]=r; ES[r]="" } ES[r]=ES[r] (ES[r]==""?"":",") expand(r,s) }
+        else if (r in ES) { if (s=="") ES[r]=""; else { toset(ES[r],S); toset(s,X); out=""; for (z in S) if (!(z in X)) out=out (out==""?"":",") z; ES[r]=out } } }
+      out=""; for(j=1;j<=ne;j++){ r=E[j]; if (ES[r]=="") continue; toset(ES[r],S); t=canon(r,S); if (t!="") out=out " " t }
+      if (out=="") next
+      l=sprintf("%-16s %-34s %s", U, substr(out,2), c); sub(/ +$/,"",l); print l }
+    END { if (!found && MODE=="add") { out=""
+            for(k=1;k<=nq;k++){ t=Q[k]; r=t; s=""; p=index(t,"@"); if(p){ r=substr(t,1,p-1); s=substr(t,p+1) }
+              if (ON!="") s=ON; toset(expand(r,s),S); t=canon(r,S); if (t!="") out=out " " t }
+            printf "%-16s %-34s # added %s\n", U, substr(out,2), STAMP } }' "$ACCESS" > "$tmp"
+  write_file "$tmp" "$ACCESS"
+}
+
+# per-node plan: what this node must look like
+plan_node(){ awk -v NODE="$1" -v ROLES="$(roles_tsv)" -v SG="$SUDO_GROUP" '
+  function inn(list,node,  a,n,k){ if(list=="all") return 1; n=split(list,a,","); for(k=1;k<=n;k++) if(a[k]==node) return 1; return 0 }
+  BEGIN { n=split(ROLES,rl,"\n")
+    for(i=1;i<=n;i++){ split(rl[i],f,"\t"); r=f[1]; RG[r]=f[2]; RN[r]=f[3]; RP[r]=f[4]; RF[r]=f[5]; RO[r]=f[6]; RSU[r]=f[7]; RH[r]=f[8]; RL[r]=f[9]; RQ[r]=f[10]; RM[r]=f[11]
+      g=split(f[2],gs,","); for(j=1;j<=g;j++) MG[gs[j]]=1
+      if (inn(f[3],NODE)) ACT[r]=1 } }
+  { l=$0; sub(/#.*/,"",l); k=split(l,a); if(!k) next; u=a[1]; print "MANAGED " u; US[u]=1
+    for(j=2;j<=k;j++){ t=a[j]; r=t; s=""; p=index(t,"@"); if(p){ r=substr(t,1,p-1); s=substr(t,p+1) }
+      if (r=="locked" || r=="nopasswd" || r=="pwonly") { if (inn(s==""?"all":s,NODE)) FLG[r,u]=1; continue }
+      if (s=="") s=RN[r]; if (!inn(s,NODE)) continue
+      ACC[u]=1; ACT[r]=1; if (!(u in HOME) && RH[r]!="/home") HOME[u]=RH[r]
+      if (RL[r]!="-") print "SLICE " u " " RL[r]
+      if (RQ[r]!="-") print "QUOTA " u " " RQ[r] " " RH[r]
+      if (RSU[r]=="yes" || index("," RG[r] ",", "," SG ",")) SUDOER[u]=1
+      g=split(RG[r],gs,","); for(x=1;x<=g;x++) if(!((gs[x],u) in M)){ M[gs[x],u]=1; MEM[gs[x]]=MEM[gs[x]] (MEM[gs[x]]==""?"":",") u } } }
+  END { for(u in US) if ((("locked",u) in FLG)) print "LOCK " u
+        for(u in ACC) { print "ACCOUNT " u " " (u in HOME ? HOME[u] : "/home")
+          if ((("pwonly",u) in FLG)) print "PWONLY " u
+          if ((("nopasswd",u) in FLG) && (u in SUDOER)) print "NOPASSWD " u }
+        for(g in MG) print "GROUP " g " " MEM[g]
+        for(r in ACT){ g=split(RG[r],gs,","); for(x=1;x<=g;x++){ G=gs[x]; print "ALLOW " G
+            if (RP[r]=="yes") print "PWD " G
+            if (RF[r]!="any") print "FROM " G " " RF[r]; else print "OPEN " G
+            if (RO[r]!="-") print "OPTS " G " " RO[r]
+            if (RSU[r]=="yes") print "SUDOGRP " G
+            if (RM[r]!="-") print "LIMITS " G " " RM[r] } } }' "$ACCESS"; }
+
+# ---------------------------------------------------------------- remote: sync
+SYNC_REMOTE=$(cat <<'EOF'
+set -euo pipefail
+H=$(hostname); D=/etc/ssh/sshd_config.d; S=/etc/sudoers.d; L=/etc/security/limits.d; SD=/etc/systemd/system
+TS=$(date +%Y%m%d-%H%M%S); BK=/root/nst-cockpit-backup/$TS; STATE=/var/lib/nst-cockpit
+say(){ echo "[$H] $*"; }
+refuse(){ say "REFUSING: $*"; exit 1; }
+do_(){ if [ "$DRY" = 1 ]; then say "would: $*"; else say "$*"; "$@" >/dev/null; fi; }
+members(){ getent group "$1" | cut -d: -f4 | tr ',' '\n' | grep -v '^$' | sort -u || true; }
+inlist(){ case " $2 " in *" $1 "*) return 0;; esac; return 1; }
+field(){ printf '%s\n' $1 | awk -F: -v k="$2" '$1==k{print $'"${3:-2}"'}'; }
+target_of(){ field "$GROUPSPEC" "$1" 3 | tr ',' ' '; }
+is_locked(){ [ "$(getent shadow "$1" | cut -d: -f8)" = 1 ]; }
+ssh_now(){
+  { grep -hE '^\s*AllowUsers' $D/*.conf /etc/ssh/sshd_config 2>/dev/null | sed -E 's/^\s*AllowUsers\s*//' | tr ' ' '\n' | sed 's/@.*//'
+    for g in $(grep -hE '^\s*AllowGroups' $D/*.conf /etc/ssh/sshd_config 2>/dev/null | sed -E 's/^\s*AllowGroups\s*//'); do members "$g"; done
+  } | grep -v '^$' | sort -u || true; }
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+ACCT_USERS=$(printf '%s\n' $ACCOUNTS | cut -d: -f1 | tr '\n' ' ')
+
+# guards: never cut off sudo or the operator
+[ "$DRY" = 0 ] || [ "$DRY" = 1 ] || refuse "bad DRY value"
+inlist "$SUDO_GROUP" "$ALLOW" || refuse "$SUDO_GROUP missing from AllowGroups"
+inlist "$OPERATOR" "$(target_of "$SUDO_GROUP")" || refuse "operator $OPERATOR would lose group $SUDO_GROUP"
+if [ "$IS_CONTROL" != 1 ]; then grep -q "^$OPERATOR ALL=(ALL:ALL) NOPASSWD: ALL" <<<"$SUDOERS" || refuse "operator $OPERATOR would lose NOPASSWD"; fi
+
+# 0. SSH gain / lose
+BEFORE=$(ssh_now)
+AFTER=$(for g in $ALLOW; do target_of "$g" | tr ' ' '\n'; done | grep -v '^$' | sort -u || true)
+say "SSH lose: $(comm -23 <(echo "$BEFORE") <(echo "$AFTER") | grep -v '^$' | tr '\n' ' ' || true)"
+say "SSH gain: $(comm -13 <(echo "$BEFORE") <(echo "$AFTER") | grep -v '^$' | tr '\n' ' ' || true)"
+
+# 1. accounts
+CREATED=""
+for spec in $ACCOUNTS; do
+  u=${spec%%:*}; base=${spec#*:}
+  id "$u" >/dev/null 2>&1 && continue
+  uid=$(field "$UIDMAP" "$u"); opt=(-m -s /bin/bash -d "$base/$u")
+  if [ -n "$uid" ] && ! getent passwd "$uid" >/dev/null; then opt+=(-u "$uid"); fi
+  [ -d "$base" ] || [ "$DRY" = 1 ] || refuse "home base $base missing for $u"
+  do_ useradd "${opt[@]}" "$u"; CREATED="$CREATED $u"
+done
+if [ "$DRY" != 1 ]; then for u in $CREATED; do
+  echo "$u:$(field "$PASSMAP" "$u")" | chpasswd; chage -d 0 "$u"; chmod 0750 "$(getent passwd "$u" | cut -d: -f6)"; done; fi
+[ -z "$CREATED" ] || say "created:$CREATED"
+
+# 2. groups = exactly access.conf
+reconcile(){ local g=$1 target cur u; target=$(echo $2); cur=$(members "$g" | tr '\n' ' ')
+  for u in $target; do inlist "$u" "$cur" || do_ gpasswd -a "$u" "$g"; done
+  for u in $cur;    do inlist "$u" "$target" || do_ gpasswd -d "$u" "$g"; done; }
+for spec in $GROUPSPEC; do
+  g=${spec%%:*}; rest=${spec#*:}; gid=${rest%%:*}; t=${rest#*:}; t=${t//,/ }
+  if ! getent group "$g" >/dev/null; then
+    [ -n "$t" ] || continue
+    if [ -n "$gid" ] && ! getent group "$gid" >/dev/null; then do_ groupadd -g "$gid" "$g"; else do_ groupadd "$g"; fi
+  fi
+  reconcile "$g" "$t"
+done
+
+# 3. lock state (locked = password locked + account expired; blocks keys too)
+for u in $MANAGED; do
+  id "$u" >/dev/null 2>&1 || continue
+  if inlist "$u" "$LOCKED"; then
+    if ! is_locked "$u"; then do_ usermod -L -e 1 "$u"; [ "$DRY" = 1 ] || pkill -KILL -u "$u" 2>/dev/null || true; fi
+  elif is_locked "$u" && inlist "$u" "$ACCT_USERS"; then
+    do_ usermod -e '' "$u"; [ "$DRY" = 1 ] || usermod -U "$u" 2>/dev/null || true
+  fi
+done
+
+# 4. per-user systemd slice limits
+SLICE_CHANGED=0; KEEP_UIDS=""
+for spec in $SLICES; do
+  u=${spec%%:*}; lim=${spec#*:}; id "$u" >/dev/null 2>&1 || continue
+  uid=$(id -u "$u"); KEEP_UIDS="$KEEP_UIDS $uid"; f=$SD/user-$uid.slice.d/50-nst-limits.conf
+  { echo "# managed by nst-cockpit for $u"; echo "[Slice]"; printf '%s\n' ${lim//,/ }; } > "$TMP/slice"
+  if ! cmp -s "$TMP/slice" "$f"; then
+    if [ "$DRY" = 1 ]; then say "would write $f: ${lim//,/ }"; else install -d -m 755 "${f%/*}"; install -m 644 "$TMP/slice" "$f"; say "slice limits $u: ${lim//,/ }"; fi
+    SLICE_CHANGED=1; fi
+done
+for f in $SD/user-*.slice.d/50-nst-limits.conf; do
+  [ -f "$f" ] || continue; grep -qE "managed by nst-cockpit${LEGACY_SLICE_MARKER:+|$LEGACY_SLICE_MARKER}" "$f" || continue
+  uid=${f#$SD/user-}; uid=${uid%%.*}; inlist "$uid" "$KEEP_UIDS" && continue
+  if [ "$DRY" = 1 ]; then say "would remove slice limits for uid $uid"; else rm -f "$f"; rmdir "${f%/*}" 2>/dev/null || true; say "removed slice limits uid $uid"; fi
+  SLICE_CHANGED=1
+done
+[ "$SLICE_CHANGED" = 0 ] || [ "$DRY" = 1 ] || systemctl daemon-reload
+
+# 5. quotas (only where the home base is a quota-enabled mount)
+[ "$DRY" = 1 ] || mkdir -p "$STATE"
+for spec in $QUOTAS; do
+  IFS=: read -r u size base <<<"$spec"; id "$u" >/dev/null 2>&1 || continue
+  grep -qx "$u $size $base" "$STATE/quota" 2>/dev/null && continue
+  if ! command -v setquota >/dev/null || ! mountpoint -q "$base"; then say "WARN quota $size for $u skipped: $base not a quota mount"; continue; fi
+  kb=$(( ${size%G} * 1024 * 1024 ))
+  do_ setquota -u "$u" 0 "$kb" 0 0 "$base"
+  [ "$DRY" = 1 ] || { grep -v "^$u " "$STATE/quota" 2>/dev/null > "$TMP/q" || true; echo "$u $size $base" >> "$TMP/q"; install -m 600 "$TMP/q" "$STATE/quota"; }
+done
+
+# 6. owned config files
+{ echo "# managed by nst-cockpit. Edit /etc/nst-cockpit/*, then nst-cockpit sync."; printf '%s\n' "$BASELINE"; echo "AllowGroups $ALLOW"; } > "$TMP/10-nst-cockpit.conf"
+{ echo "# managed by nst-cockpit. Keep LAST and Match-only."; printf '%s' "$MATCH"; } > "$TMP/99-nst-cockpit.conf"
+{ echo "# managed by nst-cockpit. Do not edit."; printf '%s' "$SUDOERS"; } > "$TMP/10-nst-cockpit"
+{ echo "# managed by nst-cockpit. Do not edit."; printf '%s' "$LIMITS"; } > "$TMP/60-nst-cockpit.conf"
+CH_SSHD=0; CH_SUDO=0; CH_LIM=0
+for f in 10-nst-cockpit.conf 99-nst-cockpit.conf; do cmp -s "$TMP/$f" "$D/$f" || CH_SSHD=1; done
+for f in $LEGACY_SSHD; do [ ! -e "$D/$f" ] || CH_SSHD=1; done
+cmp -s "$TMP/10-nst-cockpit" "$S/10-nst-cockpit" || CH_SUDO=1
+for f in $LEGACY_SUDO; do [ ! -e "$S/$f" ] || CH_SUDO=1; done
+cmp -s "$TMP/60-nst-cockpit.conf" "$L/60-nst-cockpit.conf" || CH_LIM=1
+for f in $LEGACY_LIMITS; do [ ! -e "$L/$f" ] || CH_LIM=1; done
+
+UNM=$(getent passwd | awk -F: '$3>=1000 && $3<60000{print $1}' | while read -r u; do inlist "$u" "$MANAGED" || echo "$u"; done | tr '\n' ' ' || true)
+STRAY=$(for u in $MANAGED; do if id "$u" >/dev/null 2>&1 && ! inlist "$u" "$ACCT_USERS" && ! is_locked "$u"; then echo "$u"; fi; done | tr '\n' ' ' || true)
+[ -z "$UNM" ]   || say "UNMANAGED accounts (not in access.conf): $UNM -> nst-cockpit adopt <user>"
+[ -z "$STRAY" ] || say "STRAY accounts (no access here, not locked): $STRAY -> nst-cockpit prune"
+
+if [ "$DRY" = 1 ]; then
+  diff -uN "$D/10-nst-cockpit.conf" "$TMP/10-nst-cockpit.conf" || true
+  diff -uN "$D/99-nst-cockpit.conf" "$TMP/99-nst-cockpit.conf" || true
+  diff -uN "$S/10-nst-cockpit" "$TMP/10-nst-cockpit" || true
+  diff -uN "$L/60-nst-cockpit.conf" "$TMP/60-nst-cockpit.conf" || true
+  for f in $LEGACY_SSHD; do [ ! -e "$D/$f" ] || { say "would remove $D/$f:"; sed 's/^/      /' "$D/$f"; }; done
+  for f in $LEGACY_SUDO; do [ ! -e "$S/$f" ] || { say "would remove $S/$f:"; grep -vE '^\s*(#|$)' "$S/$f" | sed 's/^/      /'; }; done
+  for f in $LEGACY_LIMITS; do [ ! -e "$L/$f" ] || say "would remove $L/$f"; done
+  exit 0
+fi
+
+if [ $((CH_SSHD + CH_SUDO + CH_LIM)) -gt 0 ]; then
+  mkdir -p "$BK"; cp -a "$D" "$BK/sshd_config.d"; cp -a "$S" "$BK/sudoers.d"; cp -a "$L" "$BK/limits.d"; say "backup: $BK"; fi
+if [ "$CH_SUDO" = 1 ]; then
+  install -m 0440 -o root -g root "$TMP/10-nst-cockpit" "$S/10-nst-cockpit"
+  if visudo -cqf "$S/10-nst-cockpit" >/dev/null; then
+    for f in $LEGACY_SUDO; do rm -f "$S/$f"; done
+    if visudo -cq >/dev/null; then say "sudoers: 10-nst-cockpit active, legacy files removed"
+    else rm -rf "$S"; cp -a "$BK/sudoers.d" "$S"; refuse "sudoers invalid after cleanup, restored $BK"; fi
+  else rm -f "$S/10-nst-cockpit"; cp -a "$BK/sudoers.d/." "$S/"; refuse "generated sudoers invalid, restored"; fi
+fi
+if [ "$CH_LIM" = 1 ]; then
+  install -m 0644 "$TMP/60-nst-cockpit.conf" "$L/60-nst-cockpit.conf"; for f in $LEGACY_LIMITS; do rm -f "$L/$f"; done; say "limits: 60-nst-cockpit.conf"; fi
+if [ "$CH_SSHD" = 1 ]; then
+  install -m 0644 "$TMP/10-nst-cockpit.conf" "$TMP/99-nst-cockpit.conf" "$D/"
+  for f in $LEGACY_SSHD; do rm -f "$D/$f"; done
+  install -d -m 755 /run/sshd
+  if sshd -t; then { systemctl reload-or-restart ssh 2>/dev/null || systemctl reload-or-restart sshd; }; say "sshd reloaded"
+  else rm -rf "$D"; cp -a "$BK/sshd_config.d" "$D"; refuse "sshd -t failed, restored $BK"; fi
+fi
+say "in sync"
+EOF
+)
+
+# ---------------------------------------------------------------- remote: account actions
+WHERE_REMOTE=$(cat <<'EOF'
+H=$(hostname)
+if ! id "$U" >/dev/null 2>&1; then echo "[$H] no account"; exit 0; fi
+sh=$(getent shadow "$U"); home=$(getent passwd "$U" | cut -d: -f6)
+st=active; [ "$(echo "$sh" | cut -d: -f8)" = 1 ] && st=LOCKED
+case "$(echo "$sh" | cut -d: -f2)" in '!'|'*'|'!*'|'') pw="no-password";; *) pw="password";; esac
+[ "$(echo "$sh" | cut -d: -f3)" = 0 ] && pw="$pw(must-change)"
+keys=$(grep -cE '^(ssh-|ecdsa-|sk-)' "$home/.ssh/authorized_keys" 2>/dev/null || true)
+sess=$(who | awk -v u="$U" '$1==u' | wc -l)
+last=$(last -n1 -w "$U" 2>/dev/null | awk 'NR==1 && NF>4 {print $4,$5,$6,$7}')
+q=$(quota -u -w "$U" 2>/dev/null | awk 'NR==3{print $2"K/"$4"K"}')
+echo "[$H] uid=$(id -u "$U") $st $pw keys=${keys:-0} sessions=$sess last=${last:--} home=$home${q:+ quota=$q} groups=$(id -nG "$U" | tr ' ' ',')"
+EOF
+)
+PASSWD_REMOTE=$(cat <<'EOF'
+H=$(hostname)
+if ! id "$U" >/dev/null 2>&1; then echo "[$H] no account"; exit 0; fi
+echo "$U:$PW" | chpasswd && chage -d 0 "$U" && echo "[$H] password reset, change forced"
+EOF
+)
+LOCK_REMOTE=$(cat <<'EOF'
+H=$(hostname)
+if ! id "$U" >/dev/null 2>&1; then exit 0; fi
+if [ "$ACTION" = lock ]; then usermod -L -e 1 "$U"; pkill -KILL -u "$U" 2>/dev/null; echo "[$H] $U locked, sessions killed"
+else usermod -e '' "$U"; usermod -U "$U" 2>/dev/null; echo "[$H] $U unlocked"; fi
+EOF
+)
+DELETE_REMOTE=$(cat <<'EOF'
+H=$(hostname)
+if ! id "$U" >/dev/null 2>&1; then echo "[$H] no account"; exit 0; fi
+uid=$(id -u "$U"); home=$(getent passwd "$U" | cut -d: -f6)
+pkill -KILL -u "$U" 2>/dev/null; sleep 1; crontab -r -u "$U" 2>/dev/null
+for g in $(id -nG "$U"); do gpasswd -d "$U" "$g" >/dev/null 2>&1; done
+if [ "$PURGE" = 1 ]; then
+  userdel -r "$U" 2>/dev/null || userdel "$U"; rm -rf "$home"
+  rm -rf "/etc/systemd/system/user-$uid.slice.d"; systemctl daemon-reload
+  sed -i "/^$U /d" /var/lib/nst-cockpit/quota 2>/dev/null
+  echo "[$H] $U deleted with home, slice limits, quota record"
+else userdel "$U" && echo "[$H] $U deleted (home kept: $home)"; fi
+EOF
+)
+
+# ---------------------------------------------------------------- remote: inventory / status / audit
+INV_REMOTE=$(cat <<'EOF'
+H=$(hostname); D=/etc/ssh/sshd_config.d
+mem(){ getent group "$1" | cut -d: -f4 | tr ',' ' '; }
+getent passwd | awk -F: '$3>=1000 && $3<60000{print $1}' | while read -r u; do
+  echo "$u acct@$H"; [ "$(getent shadow "$u" | cut -d: -f8)" = 1 ] && echo "$u locked@$H"; done
+for g in $RGROUPS; do for u in $(mem "$g"); do echo "$u grp:$g@$H"; done; done
+for f in /etc/sudoers.d/*; do [ -f "$f" ] || continue
+  awk '!/^[[:space:]]*(#|$|Defaults|%|@|[A-Z_]+_Alias)/{print $1, ($0 ~ /NOPASSWD/ ? "np" : "pw")}' "$f" | while read -r u k; do
+    echo "$u sudoers@$H"; [ "$k" = np ] && echo "$u nopasswd@$H"; done; done
+grep -hE '^\s*AllowUsers' $D/*.conf 2>/dev/null | sed -E 's/^\s*AllowUsers\s*//' | tr ' ' '\n' | sed 's/@.*//' | grep -v '^$' | while read -r u; do echo "$u ssh@$H"; done
+awk 'tolower($1)=="match" {split("",us); if (tolower($2)=="user") split($3,us,","); next} tolower($1)=="authenticationmethods" && $2=="password" {for (i in us) print us[i], "pwonly@'"$H"'"}' $D/*.conf 2>/dev/null
+true
+EOF
+)
+STATUS_REMOTE=$(cat <<'EOF'
+H=$(hostname)
+for g in $(printf "%s\n" $RGROUPS "$SUDO_GROUP" | sort -u); do getent group "$g" >/dev/null && echo "[$H] $g: $(getent group "$g" | cut -d: -f4)"; done
+echo "[$H] sshd_config.d: $(ls /etc/ssh/sshd_config.d | tr '\n' ' ')"
+echo "[$H] sudoers.d: $(ls /etc/sudoers.d | grep -v README | tr '\n' ' ')"
+EOF
+)
+AUDIT_REMOTE=$(cat <<'EOF'
+H=$(hostname); D=/etc/ssh/sshd_config.d; S=/etc/sudoers.d; L=/etc/security/limits.d
+nc(){ grep -vE '^\s*(#|$)' "$1" 2>/dev/null | sed 's/^/      /'; }
+w(){ echo "[$H] WARN $*"; }; i(){ echo "[$H] info $*"; }
+i "$(. /etc/os-release; echo "$PRETTY_NAME"), openssh $(ssh -V 2>&1 | cut -d, -f1)"
+i "sshd effective: $(sshd -T 2>/dev/null | grep -E '^(permitrootlogin|passwordauthentication|pubkeyauthentication|maxauthtries|x11forwarding|allowtcpforwarding|clientaliveinterval|allowgroups) ' | tr '\n' ';')"
+n=$(sshd -T 2>/dev/null | grep -c '^allowusers'); [ "$n" = 0 ] || w "sshd uses per-user AllowUsers ($n entries)"
+for f in $D/*; do case "${f##*/}" in 10-nst-cockpit.conf|99-nst-cockpit.conf) ;; 50-cloud-init.conf) i "cloud-init drop-in: $(nc "$f" | tr -s ' ' | tr '\n' ';')";; *) w "foreign sshd file $f:"; nc "$f";; esac; done
+grep -qiE '^\s*(PermitRootLogin\s+yes|PasswordAuthentication\s+yes)' /etc/ssh/sshd_config && i "main sshd_config has permissive lines (shadowed by drop-ins): $(grep -iE '^\s*(PermitRootLogin|PasswordAuthentication)' /etc/ssh/sshd_config | tr '\n' ';')"
+[ -s /root/.ssh/authorized_keys ] && w "root has $(grep -c . /root/.ssh/authorized_keys) authorized_keys lines (PermitRootLogin no blocks SSH use)"
+for f in $S/*; do case "${f##*/}" in README|10-nst-cockpit) ;; *) w "foreign sudoers file $f:"; nc "$f";; esac; done
+grep -vE "^\s*(#|\$|Defaults|root\s|%admin\s|%$SUDO_GROUP\s|[@#]includedir)" /etc/sudoers | sed "s/^/[$H] WARN main sudoers extra: /"
+for f in $L/*; do case "${f##*/}" in 60-nst-cockpit.conf|10-coredump-debian.conf|20-coredump-debian.conf|25-pw-rlimits.conf|10-gamemode.conf) ;; *) w "foreign limits file $f:"; nc "$f";; esac; done
+nc /etc/security/limits.conf | grep -q . && { w "limits.conf has entries:"; nc /etc/security/limits.conf; }
+for f in /etc/systemd/system/user-*.slice.d/*.conf; do [ -f "$f" ] && ! grep -q 'managed by nst-cockpit' "$f" && w "foreign slice limits $f"; done
+grep -q 'pam_unix.so.*nullok' /etc/pam.d/common-auth && w "PAM common-auth allows empty passwords (nullok)"
+grep -rqs pam_faillock /etc/pam.d/ || i "no pam_faillock (no lockout after failed logins)"
+grep -rqs pam_pwquality /etc/pam.d/ || i "no pam_pwquality (only 'obscure' password checks)"
+systemctl is-active -q fail2ban 2>/dev/null || i "fail2ban not active"
+grep -rqs pam_tty_audit /etc/pam.d/ && i "pam_tty_audit enabled (keystrokes logged to audit)"
+i "login.defs: $(grep -E '^\s*(PASS_MAX_DAYS|HOME_MODE|ENCRYPT_METHOD|UMASK)' /etc/login.defs | tr -s ' \t' ' ' | tr '\n' ';') useradd default shell: $(sed -n 's/^SHELL=//p' /etc/default/useradd)"
+awk -F: '$3==0 && $1!="root"{print "[" H "] WARN uid 0 account: " $1}' H="$H" /etc/passwd
+awk -F: '$2==""{print "[" H "] WARN empty password: " $1}' H="$H" /etc/shadow
+for g in $SUDO_GROUP adm wheel docker lxd libvirt kvm disk shadow; do m=$(getent group $g | cut -d: -f4); [ -n "$m" ] && i "group $g: $m"; done
+find /usr/local/bin /usr/local/sbin -maxdepth 1 ! -user root -printf "[$H] WARN not root-owned in root's PATH: %p (owner %u)\n" 2>/dev/null
+for s in $LEGACY_MANAGERS; do p=$(command -v "$s" 2>/dev/null || ls /usr/local/sbin/$s /usr/local/bin/$s /root/$s 2>/dev/null | head -1 || true); [ -n "$p" ] && w "legacy manager present: $p"; done
+getent passwd | awk -F: '$3>=1000 && $3<60000{print $1, $3}' | while read -r u uid; do
+  inm=0; for m in $MANAGED; do [ "$m" = "$u" ] && inm=1; done; [ $inm = 1 ] || w "unmanaged account: $u"
+  echo "ACCT $H $u $uid"; done
+EOF
+)
+
+# ---------------------------------------------------------------- build sync payload for one node
+build_payload(){ # node dry
+  local p ACCOUNTS MANAGED LOCKED ALLOW OPEN PWDG GROUPSPEC="" MATCH="" SUDOERS="" LIMITS="" SLICES QUOTAS UIDMAP
+  local PASSMAP=$PASSMAP_ALL DRY=$2 OPERATOR=$ME BASELINE IS_CONTROL=0
+  [ "$1" = "$SELF" ] && IS_CONTROL=1
+  local _ g m o ips ex addr kv ip x u lim
+  p=$(plan_node "$1")
+  pick(){ awk -v k="$1" '$1==k{print $2}' <<<"$p" | sort -u | tr '\n' ' ' | sed 's/ $//'; }
+  ACCOUNTS=$(awk '$1=="ACCOUNT"{print $2":"$3}' <<<"$p" | sort -u | tr '\n' ' ')
+  MANAGED=$(pick MANAGED); LOCKED=$(pick LOCK); ALLOW=$(pick ALLOW); OPEN=$(pick OPEN)
+  PWDG=$(pick PWD | tr ' ' ',')
+  SLICES=$(awk '$1=="SLICE"{print $2":"$3}' <<<"$p" | sort -u | tr '\n' ' ')
+  QUOTAS=$(awk '$1=="QUOTA"{print $2":"$3":"$4}' <<<"$p" | sort -u | tr '\n' ' ')
+  while read -r _ g m; do GROUPSPEC+="$g:${GIDMAP[$g]:-}:${m:-} "; done < <(awk '$1=="GROUP"' <<<"$p" | sort)
+  for u in $(pick PWONLY); do MATCH+="Match User $u"$'\n'"    PubkeyAuthentication no"$'\n'"    PasswordAuthentication yes"$'\n'"    AuthenticationMethods password"$'\n'; done
+  [ -z "$PWDG" ] || MATCH+="Match Group $PWDG"$'\n'"    PasswordAuthentication yes"$'\n'
+  while read -r _ g o; do MATCH+="Match Group $g"$'\n'; for kv in ${o//,/ }; do MATCH+="    ${kv%%=*} ${kv#*=}"$'\n'; done; done < <(awk '$1=="OPTS"' <<<"$p" | sort -u)
+  while read -r _ g ips; do
+    [ "$ips" = control ] && ips=$CONTROL_IPS
+    [ -n "$ips" ] || die "role for group $g: from = control, but no control node addresses found"
+    ex=""; for x in $OPEN; do [ "$x" = "$g" ] || ex+=",!$x"; done
+    addr="*"; for ip in ${ips//,/ }; do addr+=",!$ip"; done
+    MATCH+="Match Group $g$ex Address $addr"$'\n'"    DenyGroups $g"$'\n'
+  done < <(awk '$1=="FROM"' <<<"$p" | sort -u)
+  SUDOERS="%$SUDO_GROUP ALL=(ALL:ALL) ALL"$'\n'
+  for g in $(pick SUDOGRP); do SUDOERS+="%$g ALL=(ALL:ALL) ALL"$'\n'; done
+  for u in $(pick NOPASSWD); do SUDOERS+="$u ALL=(ALL:ALL) NOPASSWD: ALL"$'\n'; done
+  while read -r _ g lim; do for kv in ${lim//,/ }; do LIMITS+="@$g hard ${kv%%=*} ${kv#*=}"$'\n'; done; done < <(awk '$1=="LIMITS"' <<<"$p" | sort -u)
+  if [ -f "$BASELINE_FILE" ]; then BASELINE=$(grep -vE '^\s*(#|$)' "$BASELINE_FILE"); else BASELINE=$DEFAULT_BASELINE; fi
+  UIDMAP=$(getent passwd | awk -F: -v L=" $MANAGED " 'index(L, " " $1 " "){printf "%s:%s ", $1, $3}')
+  vars ACCOUNTS MANAGED LOCKED ALLOW GROUPSPEC MATCH SUDOERS LIMITS SLICES QUOTAS UIDMAP PASSMAP DRY OPERATOR IS_CONTROL SUDO_GROUP BASELINE LEGACY_SSHD LEGACY_SUDO LEGACY_LIMITS LEGACY_SLICE_MARKER
+  printf '%s\n' "$SYNC_REMOTE"
+}
+
+# ---------------------------------------------------------------- commands
+parse_on(){ ON=""; ARGS=(); while [ $# -gt 0 ]; do case "$1" in --on) ON=$(norm_nodes "${2:-}"); shift 2;; --on=*) ON=$(norm_nodes "${1#--on=}"); shift;; *) ARGS+=("$1"); shift;; esac; done
+  if [ -n "$ON" ]; then local n; for n in ${ON//,/ }; do all_nodes | tr ' ' '\n' | grep -qx "$n" || die "unknown node: $n"; done; fi; }
+norm_tokens(){ local t; for t in "$@"; do if [[ "$t" == *@* ]]; then echo "${t%%@*}@$(norm_nodes "${t#*@}")"; else echo "$t"; fi; done | tr '\n' ' '; }
+
+cmd_sync(){
+  local dry=0; if [ "${1:-}" = --dry-run ]; then dry=1; shift; fi
+  validate
+  local h u g out created failed=()
+  for g in $(role_groups); do GIDMAP[$g]=$(getent group "$g" | cut -d: -f3 || true); done
+  PASSMAP_ALL=$(for u in $(users_in_conf); do printf '%s:%s ' "$u" "$(newpass)"; done)
+  CONTROL_IPS=$(control_ips)
+  out=$(mktemp)
+  for h in $(n1_first $(nodes "$@")); do
+    echo "===== $h"
+    if ! reachable "$h"; then echo "[$h] UNREACHABLE, skipped"; failed+=("$h"); continue; fi
+    if ! run_root "$h" "$(build_payload "$h" "$dry")" | tee -a "$out"; then failed+=("$h"); fi
+  done
+  if [ "$dry" = 0 ]; then
+    created=$(sed -n 's/.*created://p' "$out" | tr ' ' '\n' | grep -v '^$' | sort -u || true)
+    if [ -n "$created" ]; then
+      echo; echo "Temporary passwords (this run only, forced change at first login; share privately):"
+      for u in $created; do printf '  %-16s %s\n' "$u" "$(tr ' ' '\n' <<<"$PASSMAP_ALL" | awk -F: -v u="$u" '$1==u{print $2}')"; done
+    fi
+  fi
+  rm -f "$out"
+  if [ ${#failed[@]} -gt 0 ]; then echo; echo "NOT synced: ${failed[*]}  -> later: nst-cockpit sync ${failed[*]}"; return 1; fi
+}
+
+cmd_grant(){
+  local u=${1:-}; [ -n "$u" ] || usage; shift; valid_user "$u"; need_access
+  parse_on "$@"; set -- ${ARGS[@]+"${ARGS[@]}"}; [ $# -gt 0 ] || die "give at least one role or flag, e.g.: nst-cockpit grant $u user (see: nst-cockpit roles)"
+  set -- $(norm_tokens "$@"); check_tokens "$@"
+  edit_tokens add "$u" "$ON" "$@"; echo "access.conf: $(grep -E "^${u}[[:space:]]" "$ACCESS")"; cmd_sync
+}
+cmd_revoke(){
+  local u=${1:-}; [ -n "$u" ] || usage; shift; need_access
+  in_conf "$u" || die "$u not in $ACCESS"
+  parse_on "$@"; set -- ${ARGS[@]+"${ARGS[@]}"}; set -- $(norm_tokens "$@"); [ $# -eq 0 ] || check_tokens "$@"
+  if [ "$u" = "$ME" ]; then [ $# -eq 0 ] || printf '%s\n' "$@" | grep -qE '^(admin|nopasswd)' && die "refusing to revoke your own admin/nopasswd"; fi
+  edit_tokens del "$u" "$ON" "$@"
+  echo "access.conf: $(grep -E "^${u}[[:space:]]" "$ACCESS" || echo "$u removed")"; cmd_sync
+}
+cmd_lock(){
+  local action=$1 u=${2:-} U ACTION; [ -n "$u" ] || usage; valid_user "$u"; shift 2 || true
+  [ "$u" != "$ME" ] || die "refusing to lock yourself"
+  parse_on "$@"
+  if [ -f "$ACCESS" ] && in_conf "$u"; then
+    if [ "$action" = lock ]; then edit_tokens add "$u" "$ON" locked; else edit_tokens del "$u" "$ON" locked; fi
+    echo "access.conf: $(grep -E "^${u}[[:space:]]" "$ACCESS")"; cmd_sync
+  else
+    echo "$u is not in access.conf: applying directly (adopt it to make this permanent)"
+    U=$u ACTION=$action; on_nodes "$(vars U ACTION)"$'\n'"$LOCK_REMOTE" $(nodes ${ON//,/ })
+  fi
+}
+cmd_where(){
+  local u=${1:-} U; [ -n "$u" ] || usage; valid_user "$u"
+  if [ -f "$ACCESS" ]; then grep -E "^${u}[[:space:]]" "$ACCESS" | sed 's/^/access.conf: /' || echo "access.conf: (not listed)"; fi
+  U=$u; on_nodes "$(vars U)"$'\n'"$WHERE_REMOTE" $(all_nodes)
+}
+cmd_passwd(){
+  local u=${1:-} U PW; [ -n "$u" ] || usage; valid_user "$u"; shift; parse_on "$@"
+  U=$u PW=$(newpass); on_nodes "$(vars U PW)"$'\n'"$PASSWD_REMOTE" $(nodes ${ON//,/ })
+  echo; echo "Temporary password for $u: $PW   (forced change at next login)"
+}
+cmd_delete(){
+  local u=${1:-} PURGE=0 U c; [ -n "$u" ] || usage; valid_user "$u"
+  [ "${2:-}" = --purge ] && PURGE=1
+  [ "$u" != "$ME" ] || die "refusing to delete yourself"
+  read -r -p "Delete account $u on ALL nodes$([ $PURGE = 1 ] && echo ' INCLUDING home, slice limits, quota')? Type the username: " c
+  [ "$c" = "$u" ] || die "aborted"
+  if [ -f "$ACCESS" ] && in_conf "$u"; then edit_tokens del "$u" ""; echo "access.conf: $u removed"; fi
+  U=$u; on_nodes "$(vars U PURGE)"$'\n'"$DELETE_REMOTE" $(all_nodes)
+}
+cmd_status(){
+  local h RGROUPS; RGROUPS=$(role_groups)
+  for h in $(nodes "$@"); do
+    if reachable "$h"; then run_root "$h" "$(vars RGROUPS SUDO_GROUP)"$'\n'"$STATUS_REMOTE" || true; else echo "[$h] UNREACHABLE"; fi
+  done
+}
+cmd_audit(){
+  local h out MANAGED=""; [ -f "$ACCESS" ] && MANAGED=$(users_in_conf)
+  out=$(mktemp)
+  for h in $(n1_first $(nodes "$@")); do
+    echo "===== $h"
+    if reachable "$h"; then run_root "$h" "$(vars MANAGED SUDO_GROUP LEGACY_MANAGERS)"$'\n'"$AUDIT_REMOTE" 2>&1 | tee -a "$out" | grep -v '^ACCT ' || true; else echo "[$h] UNREACHABLE"; fi
+  done
+  echo "===== cluster"
+  awk '$1=="ACCT"{ if (!($3 in first)) { first[$3]=$4; fh[$3]=$2 } else if (first[$3]!=$4) diff[$3]=diff[$3] " " $2 "=" $4 }
+       END { for (u in diff) print "[cluster] info uid differs for " u ": " fh[u] "=" first[u] diff[u] }' "$out" | sort
+  rm -f "$out"
+}
+
+inventory(){ # raw evidence lines from all reachable nodes
+  local h RGROUPS; RGROUPS=$(role_groups | tr ' ' '\n' | sort -u | tr '\n' ' ')" $SUDO_GROUP"
+  for h in $(n1_first $(all_nodes)); do
+    if ! reachable "$h"; then echo "skip $h (unreachable)" >&2; continue; fi
+    run_root "$h" "$(vars RGROUPS)"$'\n'"$INV_REMOTE" || echo "inventory failed on $h" >&2
+  done
+}
+draft(){ # raw-file [only-user]  -> access.conf lines
+  awk -v ROLES="$(roles_tsv)" -v ONLY="${2:-}" -v SG="$SUDO_GROUP" -v SHELLROLE="$SHELL_ROLE" '
+    function inn(list,node,  a,n,k){ if(list=="all") return 1; n=split(list,a,","); for(k=1;k<=n;k++) if(a[k]==node) return 1; return 0 }
+    function csv(hs,  a,n,i,out,seen2){ n=split(hs,a," "); out=""; for(i=1;i<=n;i++) if(!(a[i] in seen2)){ seen2[a[i]]=1; out=out (out==""?"":",") a[i] } return out }
+    function scope(r,hs,  want,n,a,i,c,tot){ # hosts the role covers -> token
+      tot=0; c=0; for(h in H) if (inn(RN[r],h)) { tot++; if (index(" " hs " ", " " h " ")) c++ }
+      if (c==tot) return r; return r "@" csv(hs) }
+    BEGIN { n=split(ROLES,rl,"\n")
+      for(i=1;i<=n;i++){ split(rl[i],f,"\t"); r=f[1]; RG[r]=f[2]; RN[r]=f[3]; RSU[r]=f[7]; NG[r]=split(f[2],tmp,","); ORD[++no]=r
+        GIVES[r]=(f[7]=="yes" || index("," f[2] ",", "," SG ",")) ? 1 : 0 }
+      for(i=1;i<=no;i++) for(j=i+1;j<=no;j++) if (NG[ORD[j]]>NG[ORD[i]]) { t=ORD[i]; ORD[i]=ORD[j]; ORD[j]=t } }
+    { u=$1; t=$2; split(t,x,"@"); kind=x[1]; host=x[2]; if (ONLY!="" && u!=ONLY) next; U[u]=1; H[host]=1
+      if (kind=="acct") { acc[u]=acc[u] " " host; next }
+      if (!seen[u,t]++) tags[u]=tags[u] (tags[u]==""?"":",") t
+      if (kind ~ /^grp:/) GM[u, substr(kind,5), host]=1
+      if (kind=="grp:" SG || kind=="sudoers") sudoh[u]=sudoh[u] " " host
+      if (kind=="nopasswd") nph[u]=nph[u] " " host
+      if (kind=="pwonly") pwo[u]=pwo[u] " " host
+      if (kind=="ssh") sshh[u]=sshh[u] " " host
+      if (kind=="locked") lk[u]=1 }
+    END { for (u in U) { tok=""; why=""; split("",CG); split("",COV); split("",SCOV)
+        for (i=1;i<=no;i++) { r=ORD[i]; ng=split(RG[r],gs,","); hs=""
+          for (h in H) { if (!inn(RN[r],h)) continue; ok=1; for(k=1;k<=ng;k++) if (!((u,gs[k],h) in GM)) ok=0; if (ok) hs=hs " " h }
+          if (hs=="") continue
+          red=1; m=split(hs,hh," "); for(j=1;j<=m;j++) for(k=1;k<=ng;k++) if (!((hh[j],gs[k]) in CG)) red=0
+          if (red) continue
+          tok=tok " " scope(r,hs)
+          for(j=1;j<=m;j++){ COV[hh[j]]=1; if (GIVES[r]) SCOV[hh[j]]=1; for(k=1;k<=ng;k++) CG[hh[j],gs[k]]=1 } }
+        m=split(sudoh[u],hh," "); bad=""; for(j=1;j<=m;j++) if (!(hh[j] in SCOV) && !index(bad," " hh[j])) bad=bad " " hh[j]
+        if (bad!="") why=why " sudo on" bad " is not covered by a role;"
+        m=split(sshh[u],hh," "); extra=""; for(j=1;j<=m;j++) if (!(hh[j] in COV) && !index(extra," " hh[j])) extra=extra " " hh[j]
+        if (extra!="") { if (SHELLROLE in RG) tok=tok " " SHELLROLE "@" csv(extra); else why=why " ssh on" extra " is not covered by a role;" }
+        if (nph[u]!="") tok=tok " nopasswd@" csv(nph[u])
+        if (pwo[u]!="") tok=tok " pwonly@" csv(pwo[u])
+        if (lk[u]) tok=tok " locked"
+        sub(/^ /,"",tok)
+        if (tok=="") { tok="review"; why=" account only on" acc[u] "; give a role, lock or delete it;" }
+        else if (why!="") tok=tok " review"
+        printf "%-16s %-34s # %s%s\n", u, tok, (why!="" ? "review:" why " " : ""), tags[u] } }' "$1" | sort -b -k2,2 -k1,1
+}
+cmd_init(){ # [control-node node..]
+  [ ! -e "$ACCESS" ] || die "$ACCESS already exists. Edit: sudoedit $ACCESS   or adopt single users"
+  local raw tmp n; raw=$(mktemp); tmp=$(mktemp)
+  if [ ! -s "$NODES_FILE" ]; then
+    [ $# -gt 0 ] || die "usage: nst-cockpit init <control-node> [node...]   (control node first; run it there)"
+    [ "$1" = "$SELF" ] || echo "note: control node '$1' is not this host's name ($SELF); it must be how this host is listed" >&2
+    printf '%s\n' "$@" > "$tmp"; write_file "$tmp" "$NODES_FILE"; tmp=$(mktemp)
+  fi
+  [ -f "$SITE_FILE" ] || { printf '%s\n' "# nst-cockpit site settings (shell syntax). See: man nst-cockpit" \
+      "CONTROL=$(all_nodes | awk '{print $1}')" "SUDO_GROUP=$SUDO_GROUP" "SHELL_ROLE=$SHELL_ROLE" \
+      '#LEGACY_SSHD="00-old-lockdown.conf"       # sshd_config.d files to replace' \
+      '#LEGACY_SUDO="90-old-admins"              # sudoers.d files to replace' \
+      '#LEGACY_LIMITS=""' '#LEGACY_SLICE_MARKER="managed by old-tool"' '#LEGACY_MANAGERS="old-adduser.sh"' > "$tmp"
+    write_file "$tmp" "$SITE_FILE"; tmp=$(mktemp); }
+  [ -f "$ROLES_FILE" ] || { printf '%s' "$DEFAULT_ROLES" > "$tmp"; write_file "$tmp" "$ROLES_FILE"; tmp=$(mktemp); }
+  [ -f "$BASELINE_FILE" ] || { printf '%s\n' "# global sshd settings written to 10-nst-cockpit.conf on every node" "$DEFAULT_BASELINE" > "$tmp"; write_file "$tmp" "$BASELINE_FILE"; tmp=$(mktemp); }
+  require_control
+  echo "roles: $ROLES_FILE (if you change roles later: sudo rm $ACCESS && nst-cockpit init)" >&2
+  inventory > "$raw"
+  {
+    echo "# nst-cockpit source of truth.   <user> <token> [token..]   [# comment]"
+    echo "#   token: role | role@node,node | flag | flag@node   roles: nst-cockpit roles   flags: $FLAGS"
+    echo "#   every account on every node should be listed here. Groups in roles.ini are made exact."
+    echo "#   'review' MUST be resolved (adjust tokens, delete the word) before sync."
+    echo "# Draft $(date -Is) from current state. Comment = evidence (grp:<group>@node, sudoers@node, ssh@node)."
+    draft "$raw"
+  } > "$tmp"
+  rm -f "$raw"; write_file "$tmp" "$ACCESS"
+  echo "Draft: $ACCESS ($(grep -c ' review' "$ACCESS" || true) lines need review). Next: sudoedit $ACCESS ; nst-cockpit sync --dry-run"
+}
+cmd_adopt(){
+  local u=${1:-} raw line tmp; [ -n "$u" ] || usage; valid_user "$u"; need_access
+  in_conf "$u" && die "$u already in access.conf"
+  raw=$(mktemp); inventory > "$raw"; line=$(draft "$raw" "$u"); rm -f "$raw"
+  [ -n "$line" ] || die "$u has no account on any reachable node"
+  echo "$line"
+  read -r -p "Append this line to access.conf? [y/N] " c; [ "$c" = y ] || die "aborted"
+  tmp=$(mktemp); cat "$ACCESS" > "$tmp"; echo "$line" >> "$tmp"; write_file "$tmp" "$ACCESS"
+  if grep -q ' review' <<<"$line"; then echo "Resolve 'review' (sudoedit $ACCESS), then: nst-cockpit sync"; else cmd_sync; fi
+}
+cmd_prune(){
+  local dry=0 h p accounts managed U ACTION=lock u; [ "${1:-}" = --dry-run ] && dry=1
+  validate
+  for h in $(n1_first $(all_nodes)); do
+    reachable "$h" || { echo "[$h] UNREACHABLE"; continue; }
+    p=$(plan_node "$h"); accounts=$(awk '$1=="ACCOUNT"{print $2}' <<<"$p" | tr '\n' ' '); managed=$(awk '$1=="MANAGED"{print $2}' <<<"$p" | tr '\n' ' ')
+    for u in $managed; do
+      case " $accounts " in *" $u "*) continue;; esac
+      [ "$u" = "$ME" ] && continue
+      if [ $dry = 1 ]; then run_root "$h" "$(vars u)"$'\n''id "$u" >/dev/null 2>&1 && [ "$(getent shadow "$u" | cut -d: -f8)" != 1 ] && echo "[$(hostname)] would lock stray $u"; true'
+      else U=$u; run_root "$h" "$(vars U ACTION)"$'\n'"$LOCK_REMOTE" | grep -v '^$' || true; fi
+    done
+  done
+}
+
+case "${1:-}" in
+  version|roles|-h|--help|help|"") ;;
+  *) [ "$(id -u)" -ne 0 ] || die "run as your own user, not root (needs your SSH key)"
+     [ "$1" = init ] || require_control ;;
+esac
+case "${1:-}" in
+  grant|add)     shift; cmd_grant "$@" ;;
+  revoke|remove) shift; cmd_revoke "$@" ;;
+  lock|unlock)   a=$1; shift; cmd_lock "$a" "$@" ;;
+  where)         shift; cmd_where "$@" ;;
+  passwd)        shift; cmd_passwd "$@" ;;
+  delete)        shift; cmd_delete "$@" ;;
+  adopt)         shift; cmd_adopt "$@" ;;
+  prune)         shift; cmd_prune "$@" ;;
+  init)          shift; cmd_init "$@" ;;
+  sync)          shift; cmd_sync "$@" ;;
+  audit)         shift; cmd_audit "$@" ;;
+  status)        shift; cmd_status "$@" ;;
+  list)          need_access; cat "$ACCESS" ;;
+  roles)         roles_tsv | awk -F'\t' 'BEGIN{print "role        groups              nodes    pw   sudo  from | sshd | home | slice | quota | limits"} {printf "%-11s %-19s %-8s %-4s %-5s %s | %s | %s | %s | %s | %s\n", $1,$2,$3,$4,$7,$5,$6,$8,$9,$10,$11}' ;;
+  version)       echo "nst-cockpit $VERSION" ;;
+  *)             usage ;;
+esac

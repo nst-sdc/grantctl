@@ -1,0 +1,581 @@
+.\" nst-cockpit(8) - cluster-wide user and auth management
+.TH NST-COCKPIT 8 "November 2026" "nst-cockpit 1.0.0" "System Administration"
+.nh
+.SH NAME
+nst-cockpit \- manage accounts, SSH, sudo and resource limits on every node of a small Linux cluster from one file
+.SH SYNOPSIS
+.nf
+\fBnst-cockpit grant\fR \fIuser\fR \fItoken\fR... [\fB\-\-on\fR \fInodes\fR]
+\fBnst-cockpit revoke\fR \fIuser\fR [\fItoken\fR...] [\fB\-\-on\fR \fInodes\fR]
+\fBnst-cockpit lock\fR|\fBunlock\fR \fIuser\fR [\fB\-\-on\fR \fInodes\fR]
+\fBnst-cockpit where\fR \fIuser\fR
+\fBnst-cockpit passwd\fR \fIuser\fR [\fB\-\-on\fR \fInodes\fR]
+\fBnst-cockpit delete\fR \fIuser\fR [\fB\-\-purge\fR]
+\fBnst-cockpit adopt\fR \fIuser\fR
+\fBnst-cockpit prune\fR [\fB\-\-dry\-run\fR]
+\fBnst-cockpit init\fR \fIcontrol-node\fR [\fInode\fR...]
+\fBnst-cockpit sync\fR [\fB\-\-dry\-run\fR] [\fInode\fR...]
+\fBnst-cockpit audit\fR [\fInode\fR...]
+\fBnst-cockpit status\fR [\fInode\fR...]
+\fBnst-cockpit list\fR | \fBroles\fR | \fBversion\fR
+.fi
+.SH DESCRIPTION
+.B nst-cockpit
+keeps every node of a cluster in step with one source of truth on a
+.IR "control node" .
+Each user is one line in
+.IR access.conf .
+Each line lists the user's roles and flags.
+.B sync
+pushes that state to every node over SSH.
+.PP
+On each node, sync does the following:
+.IP \(bu 2
+creates missing accounts, using the user's UID from the control node when it is free;
+.IP \(bu 2
+sets the membership of every role group to exactly what
+.I access.conf
+says, removing anyone who is not listed;
+.IP \(bu 2
+locks or unlocks accounts;
+.IP \(bu 2
+writes its own sshd, sudoers and pam_limits files;
+.IP \(bu 2
+writes per-user systemd slice limits and applies disk quotas.
+.PP
+Accounts that are not listed are never modified. They are reported as UNMANAGED.
+.PP
+Run it on the control node as your own user, not as root.
+It reaches the other nodes with your SSH key and uses
+.B sudo \-n
+there, so your account needs passwordless sudo on every node except the control node.
+.SH REQUIREMENTS
+.IP \(bu 2
+Debian or Ubuntu nodes, with systemd.
+.IP \(bu 2
+OpenSSH with
+.B Include /etc/ssh/sshd_config.d/*.conf
+at the top of
+.IR sshd_config ,
+which is the default on Ubuntu 20.04 and later and on Debian 11 and later.
+.IP \(bu 2
+sudo with
+.B @includedir /etc/sudoers.d
+or
+.BR #includedir .
+.IP \(bu 2
+bash 4.4 or later, awk (mawk or gawk), openssl, iproute2.
+.IP \(bu 2
+Optional: the
+.B quota
+package, for the
+.B quota
+role key.
+.SH ACCESS.CONF
+One user per line:
+.PP
+.nf
+.RS
+\fIuser\fR  \fItoken\fR [\fItoken\fR ...]   [# comment]
+.RE
+.fi
+.PP
+A
+.I token
+is a role or a flag. Either can be scoped to nodes with
+.BR @ :
+.TP
+.I role
+The role on its default nodes, as set in
+.IR roles.ini .
+.TP
+.IB role @ node , node
+The role on the listed nodes only.
+.TP
+.B locked
+The account is locked (password locked and account expired, so SSH keys are blocked too), and its running processes are killed.
+.TP
+.B nopasswd
+Passwordless sudo
+.RB ( "NOPASSWD: ALL" )
+on every node where the user also has sudo through a role.
+.TP
+.B pwonly
+Password-only SSH: public keys are refused.
+.PP
+Flags can be scoped like roles, for example
+.BR locked@gpu1 .
+A user with no role must be marked
+.BR locked .
+In commands, node names may be shortened when the result is unambiguous
+.RB ( 3
+for
+.BR node3 );
+they are always stored in full.
+.PP
+Example:
+.PP
+.nf
+.RS
+alice      admin nopasswd
+bob        admin
+carol      student
+dave       student gpu pwonly@node1
+erin       user@node3,node4
+frank      locked
+.RE
+.fi
+.SH ROLES.INI
+One
+.BI [ name ]
+section per role.
+.B nst-cockpit roles
+prints the effective definitions.
+.TP
+.B groups
+Unix groups the role puts users in, comma separated. Required.
+Every group named in
+.I roles.ini
+is managed exactly on every node.
+.TP
+.B nodes
+Default nodes:
+.B all
+or a comma list. A token
+.IB role @ nodes
+overrides it.
+Default:
+.BR all .
+.TP
+.B password
+.B yes
+allows SSH password login for these groups.
+Default:
+.BR no .
+.TP
+.B from
+.BR any ,
+.BR control ,
+or a comma list of source IPs.
+SSH for these groups is accepted only from those addresses, unless the user also has a role with
+.BR "from = any" .
+.B control
+means the addresses of the control node's default-route interface. This gives the jump-host pattern: users must log in to the control node first.
+Default:
+.BR any .
+.TP
+.B sshd
+Extra sshd options for these groups, as
+.IR Key = Val , Key = Val .
+.TP
+.B sudo
+.B yes
+writes
+.B "%group ALL=(ALL:ALL) ALL"
+for each group of the role.
+Not needed for roles that include the
+.B SUDO_GROUP
+group.
+Default:
+.BR no .
+.TP
+.B home
+Base directory for accounts that sync creates through this role.
+Existing homes are never moved.
+Default:
+.IR /home .
+.TP
+.B slice
+Per-user systemd slice limits (for example
+.BR CPUQuota=800%,MemoryMax=20G ),
+written to
+.IR /etc/systemd/system/user\- UID .slice.d/50\-nst\-limits.conf .
+.TP
+.B quota
+Block quota per user (for example
+.BR 90G )
+on the filesystem that holds
+.BR home .
+It is only applied when that path is a quota-enabled mount.
+.TP
+.B limits
+pam_limits for the group, as
+.IR item = value , item = value ,
+written to
+.IR /etc/security/limits.d/60\-nst\-cockpit.conf .
+.PP
+The default
+.I roles.ini
+defines
+.B admin
+(groups
+.BR cluster\-admins ", " sudo :
+SSH and sudo everywhere) and
+.B user
+(group
+.BR cluster\-users :
+plain SSH).
+It also contains commented examples for a
+.B student
+role and a
+.B gpu
+role.
+.SH COCKPIT.CONF
+Optional site settings, in shell syntax:
+.TP
+.B CONTROL
+Name of the control node, as written in
+.IR nodes .
+Default: the first line of
+.IR nodes .
+.TP
+.B SUDO_GROUP
+The group that the distribution's
+.I /etc/sudoers
+grants full sudo. Default:
+.BR sudo .
+.TP
+.B SHELL_ROLE
+The role
+.B init
+uses for SSH access it finds outside other roles. Default:
+.BR user .
+.TP
+.BR LEGACY_SSHD ", " LEGACY_SUDO ", " LEGACY_LIMITS
+Space-separated file names in
+.IR sshd_config.d ,
+.I sudoers.d
+and
+.I limits.d
+that nst-cockpit replaces.
+They are removed only after the new files validate.
+Use these to absorb an existing hand-made setup.
+.TP
+.B LEGACY_SLICE_MARKER
+Regular expression for slice drop-ins written by another tool that nst-cockpit may take over or remove.
+.TP
+.B LEGACY_MANAGERS
+Names of old management scripts;
+.B audit
+warns while they are still installed.
+.SH COMMANDS
+Commands marked
+.I (syncs)
+edit
+.I access.conf
+and then run
+.B sync
+on all nodes.
+.TP
+\fBgrant\fR \fIuser\fR \fItoken\fR... [\fB\-\-on\fR \fInodes\fR]
+Add roles or flags; at least one token is required.
+A scope is merged with any existing one.
+Creates the line if the user is new.
+.I (syncs)
+.TP
+\fBrevoke\fR \fIuser\fR [\fItoken\fR...] [\fB\-\-on\fR \fInodes\fR]
+Remove roles or flags.
+.RS
+.IP \(bu 2
+With
+.BR \-\-on ,
+removes them only on those nodes.
+.IP \(bu 2
+With
+.B \-\-on
+and no tokens, removes everything the user has on those nodes.
+.IP \(bu 2
+With neither, drops the user from
+.IR access.conf .
+The accounts stay; see
+.B prune
+and
+.BR delete .
+.RE
+.I (syncs)
+.TP
+\fBlock\fR|\fBunlock\fR \fIuser\fR [\fB\-\-on\fR \fInodes\fR]
+Set or clear the
+.B locked
+flag.
+If the user is not in
+.IR access.conf ,
+the lock is applied directly on the nodes instead.
+.I (syncs)
+.TP
+\fBwhere\fR \fIuser\fR
+For every node, shows:
+.RS
+.IP \(bu 2
+UID, and whether the account is locked;
+.IP \(bu 2
+password state (set, unset, or must change);
+.IP \(bu 2
+SSH key count, open sessions, last login;
+.IP \(bu 2
+home, quota and groups.
+.RE
+.TP
+\fBpasswd\fR \fIuser\fR [\fB\-\-on\fR \fInodes\fR]
+Sets one random temporary password on the given nodes (default: all) and forces a change at the next login.
+The password is printed once.
+.TP
+\fBdelete\fR \fIuser\fR [\fB\-\-purge\fR]
+Deletes the account on every node, after you type the username to confirm.
+It kills the user's processes, removes the crontab and the line in
+.IR access.conf .
+.B \-\-purge
+also removes the home directory, slice limits and quota record.
+.TP
+\fBadopt\fR \fIuser\fR
+Builds an
+.I access.conf
+line from the user's current state on all nodes, shows it, and appends it after confirmation.
+.TP
+\fBprune\fR [\fB\-\-dry\-run\fR]
+Locks accounts that exist on a node where the user has no access.
+.TP
+\fBinit\fR \fIcontrol-node\fR [\fInode\fR...]
+One-time setup, run on the control node. Writes
+.IR nodes ,
+.IR cockpit.conf ,
+.I roles.ini
+and
+.IR sshd-baseline ,
+then inventories every node and drafts
+.IR access.conf .
+Changes nothing on the nodes.
+.TP
+\fBsync\fR [\fB\-\-dry\-run\fR] [\fInode\fR...]
+Makes the nodes match
+.IR access.conf ,
+control node first.
+.B \-\-dry\-run
+shows:
+.RS
+.IP \(bu 2
+SSH gains and losses;
+.IP \(bu 2
+every account, group and lock change;
+.IP \(bu 2
+file diffs;
+.IP \(bu 2
+the content of every legacy file it would remove.
+.RE
+.TP
+\fBaudit\fR [\fInode\fR...]
+Read-only report of every auth-related setting:
+.RS
+.IP \(bu 2
+effective sshd settings;
+.IP \(bu 2
+sshd, sudoers, limits and slice files nst-cockpit does not own;
+.IP \(bu 2
+extra lines in the main
+.IR /etc/sudoers ;
+.IP \(bu 2
+PAM gaps;
+.IP \(bu 2
+UID 0 accounts and empty passwords;
+.IP \(bu 2
+non-root-owned binaries in root's PATH;
+.IP \(bu 2
+legacy managers and unmanaged accounts;
+.IP \(bu 2
+UIDs that differ across nodes.
+.RE
+.TP
+\fBstatus\fR [\fInode\fR...]
+Role group members and owned files per node.
+.TP
+.BR list ", " roles ", " version
+Print
+.IR access.conf ,
+the effective role table, or the version.
+.SH ADOPTING AN EXISTING CLUSTER
+.IP 1. 4
+Snapshot
+.IR /etc/passwd ,
+.IR /etc/shadow ,
+.IR /etc/group ,
+.IR /etc/gshadow ,
+.IR /etc/ssh ,
+.I /etc/sudoers*
+and
+.I /etc/security
+on every node.
+.IP 2. 4
+On the control node:
+.BR "nst-cockpit init" " \fIcontrol-node node\fR..."
+It writes the configuration and drafts
+.I access.conf
+from what it finds. Nothing on the nodes changes.
+.IP 3. 4
+Run
+.B "nst-cockpit audit"
+and read every WARN line.
+.IP 4. 4
+Edit
+.I roles.ini
+to match the groups you already use, and list the old files in the
+.B LEGACY_*
+settings of
+.IR cockpit.conf .
+If you changed roles, redraft with
+.BR "sudo rm /etc/nst-cockpit/access.conf && nst-cockpit init" .
+.IP 5. 4
+Resolve every
+.B review
+in
+.IR access.conf .
+.IP 6. 4
+Run
+.B "nst-cockpit sync \-\-dry\-run"
+until it shows no REFUSING and every SSH loss is intended.
+.IP 7. 4
+Sync one node at a time, control node last, keeping a root shell open:
+.BR "nst-cockpit sync node3" .
+.SH FILES
+.TP
+.I /etc/nst-cockpit/
+Configuration on the control node:
+.IR access.conf ,
+.IR roles.ini ,
+.IR nodes ,
+.IR cockpit.conf ,
+.IR sshd-baseline .
+Override the directory with
+.BR NST_COCKPIT_CONF .
+.TP
+.I /etc/ssh/sshd_config.d/10\-nst\-cockpit.conf
+Baseline settings plus
+.BR AllowGroups .
+.TP
+.I /etc/ssh/sshd_config.d/99\-nst\-cockpit.conf
+Match blocks: password login, per-group options, source restrictions,
+.BR pwonly .
+.TP
+.I /etc/sudoers.d/10\-nst\-cockpit
+The
+.B SUDO_GROUP
+rule, role
+.B "%group"
+rules and NOPASSWD lines.
+.TP
+.I /etc/security/limits.d/60\-nst\-cockpit.conf
+Group pam_limits.
+.TP
+.I /etc/systemd/system/user\-UID.slice.d/50\-nst\-limits.conf
+Per-user cgroup limits.
+.TP
+.I /var/lib/nst\-cockpit/quota
+Record of applied quotas.
+.TP
+.I /root/nst\-cockpit\-backup/TIMESTAMP/
+Copy of
+.IR sshd_config.d ,
+.I sudoers.d
+and
+.I limits.d
+taken before every change.
+.PP
+Do not edit owned files by hand: the next sync overwrites them.
+.SH SAFETY
+.IP \(bu 2
+Every node refuses the sync if it would remove the operator from
+.BR SUDO_GROUP ,
+remove the operator's NOPASSWD on nodes other than the control node, or leave
+.B SUDO_GROUP
+without members.
+.IP \(bu 2
+Sudoers changes are applied in two steps. The new file is validated with
+.BR "visudo \-cf" ;
+the legacy files are then removed and the whole tree is checked with
+.BR "visudo \-c" .
+Any failure restores the backup.
+.IP \(bu 2
+sshd changes are checked with
+.B "sshd \-t"
+before reload. A failure restores the backup.
+.IP \(bu 2
+Reloading sshd does not end existing sessions.
+.IP \(bu 2
+Group membership and accounts are not part of the backup. Restore those from your own snapshot.
+.SH EXAMPLES
+.TP
+Set up a cluster (on the control node):
+.nf
+.B nst-cockpit init node1 node2 node3 gpu1
+.fi
+.TP
+New student on the control node:
+.B nst-cockpit grant rahul student
+.TP
+New admin:
+.B nst-cockpit grant priya admin nopasswd
+.TP
+Shell on one node only:
+.B nst-cockpit grant rahul user \-\-on node3
+.TP
+Remove someone's access on one node:
+.B nst-cockpit revoke rahul \-\-on node3
+.TP
+Suspend, then restore:
+.B nst-cockpit lock rahul
+;
+.B nst-cockpit unlock rahul
+.TP
+Forgotten password:
+.B nst-cockpit passwd rahul
+.TP
+Drift check (expect no output):
+.nf
+.B "nst-cockpit sync \-\-dry\-run | grep \-E 'would|REFUSING|UNMANAGED|STRAY'"
+.fi
+.TP
+Bring a node that was offline back in line:
+.B nst-cockpit sync node2
+.SH NOTES
+.IP \(bu 2
+sudo applies the
+.I last
+matching rule. A
+.B "%group ALL"
+line read after a user's NOPASSWD line overrides it.
+nst-cockpit writes NOPASSWD lines last. List old sudoers files that grant group rules in
+.BR LEGACY_SUDO .
+.IP \(bu 2
+.B visudo \-c
+fails on any sudoers file that is not mode 0440, even an old one. Fix modes, or list the file in
+.BR LEGACY_SUDO .
+.IP \(bu 2
+Group changes take effect at the next login. A session that is already open keeps its old groups.
+.IP \(bu 2
+The first login after
+.B passwd
+or account creation must be from an interactive terminal, because the forced password change needs a TTY.
+Editor remote extensions fail until the password has been changed once.
+.IP \(bu 2
+Temporary passwords are generated per run.
+Accounts created by separate
+.B sync
+runs get different passwords; use
+.B passwd
+to set one password across nodes.
+.IP \(bu 2
+.B sync
+exits 1 when a node is unreachable. The other nodes are still synced.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Validation failed, a node refused, or a node was unreachable.
+.SH SEE ALSO
+.BR sshd_config (5),
+.BR sudoers (5),
+.BR limits.conf (5),
+.BR systemd.resource-control (5),
+.BR setquota (8),
+.BR usermod (8)

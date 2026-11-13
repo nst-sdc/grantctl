@@ -1,0 +1,4 @@
+# never commit a live roster or secrets
+access.conf
+*.log
+*passwords*
