@@ -1,3 +1,10 @@
+grantctl (1.0.1) resolute; urgency=medium
+
+  * init: remove the import option.
+  * Only files listed in LEGACY_* are replaced; no built-in legacy names.
+
+ -- Krushn Dayshmookh <krushndayshmookh@gmail.com>  Thu, 26 Nov 2026 12:00:00 +0530
+
 grantctl (1.0.0) resolute; urgency=medium
 
   * First release of grantctl.

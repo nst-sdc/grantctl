@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.1
+
+- Removed the import option of `init`. `init` only drafts a configuration from the nodes.
+- No file is treated as legacy by default any more. grantctl replaces only the files listed in
+  `LEGACY_SSHD`, `LEGACY_SUDO`, `LEGACY_LIMITS` and `LEGACY_SLICE_MARKER`.
+
 ## 1.0.0
 
 First release.
