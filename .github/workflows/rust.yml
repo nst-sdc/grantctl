@@ -1,9 +1,9 @@
 name: rust
 on:
   push:
-    branches: [rust]
+    branches: [main]
   pull_request:
-    branches: [rust]
+    branches: [main]
 
 jobs:
   stable:
